@@ -10,12 +10,43 @@ use PVE::ACME::Challenge;
 use PVE::ACME::DNSChallenge;
 use PVE::ACME::StandAlone;
 use PVE::Cluster qw(cfs_read_file cfs_write_file cfs_register_file cfs_lock_file);
+use PVE::Exception qw(raise_perm_exc);
 use PVE::JSONSchema qw(register_standard_option get_standard_option);
+use PVE::RPCEnvironment;
 use PVE::Tools qw(extract_param);
 
 use base qw(PVE::RESTHandler);
 
 my $plugin_config_file = "priv/acme/plugins.cfg";
+
+# The plugin property with the DNS API credentials.
+my $secret_property = 'data';
+
+# Sys.Modify on / grants every plugin operation. Each Sys.ACME.Plugin privilege
+# grants one operation on one plugin through /acme/plugins/<id>.
+my $has_plugin_privilege = sub {
+    my ($pluginid, $privilege) = @_;
+
+    my $rpcenv = PVE::RPCEnvironment::get();
+    my $authuser = $rpcenv->get_user();
+
+    return 1 if $authuser eq 'root@pam';
+    return 1 if $rpcenv->check($authuser, '/', ['Sys.Modify'], 1);
+    return $rpcenv->check($authuser, "/acme/plugins/$pluginid", [$privilege], 1);
+};
+
+my $assert_plugin_privilege = sub {
+    my ($pluginid, $privilege) = @_;
+
+    raise_perm_exc("/acme/plugins/$pluginid, $privilege")
+        if !$has_plugin_privilege->($pluginid, $privilege);
+};
+
+my $plugin_permissions = {
+    description => "Requires Sys.Modify on / or the Sys.ACME.Plugin privilege for the"
+        . " operation on /acme/plugins/<id>.",
+    user => 'all',
+};
 
 cfs_register_file(
     $plugin_config_file,
@@ -47,6 +78,9 @@ my $modify_cfg_for_api = sub {
     $plugin_cfg->{plugin} = $pluginid;
     $plugin_cfg->{digest} = $cfg->{digest};
 
+    delete $plugin_cfg->{$secret_property}
+        if !$has_plugin_privilege->($pluginid, 'Sys.ACME.Plugin.Secret.Audit');
+
     return $plugin_cfg;
 };
 
@@ -67,7 +101,9 @@ __PACKAGE__->register_method({
     path => '',
     method => 'GET',
     permissions => {
-        check => ['perm', '/', ['Sys.Modify']],
+        description => "Only plugins where the user has Sys.Modify on / or"
+            . " Sys.ACME.Plugin.Audit on /acme/plugins/<id> are listed.",
+        user => 'all',
     },
     description => "ACME plugin index.",
     protected => 1,
@@ -94,6 +130,7 @@ __PACKAGE__->register_method({
 
         my $res = [];
         foreach my $pluginid (keys %{ $cfg->{ids} }) {
+            next if !$has_plugin_privilege->($pluginid, 'Sys.ACME.Plugin.Audit');
             my $plugin_cfg = $modify_cfg_for_api->($cfg, $pluginid);
             next if $param->{type} && $param->{type} ne $plugin_cfg->{type};
             push @$res, $plugin_cfg;
@@ -108,9 +145,7 @@ __PACKAGE__->register_method({
     path => '{id}',
     method => 'GET',
     description => "Get ACME plugin configuration.",
-    permissions => {
-        check => ['perm', '/', ['Sys.Modify']],
-    },
+    permissions => $plugin_permissions,
     protected => 1,
     parameters => {
         additionalProperties => 0,
@@ -122,6 +157,8 @@ __PACKAGE__->register_method({
     code => sub {
         my ($param) = @_;
 
+        $assert_plugin_privilege->($param->{id}, 'Sys.ACME.Plugin.Audit');
+
         my $cfg = load_config();
         return $modify_cfg_for_api->($cfg, $param->{id});
     },
@@ -132,9 +169,7 @@ __PACKAGE__->register_method({
     path => '',
     method => 'POST',
     description => "Add ACME plugin configuration.",
-    permissions => {
-        check => ['perm', '/', ['Sys.Modify']],
-    },
+    permissions => $plugin_permissions,
     protected => 1,
     parameters => $acme_challenge_create_schema,
     returns => {
@@ -145,6 +180,10 @@ __PACKAGE__->register_method({
 
         my $id = extract_param($param, 'id');
         my $type = extract_param($param, 'type');
+
+        $assert_plugin_privilege->($id, 'Sys.ACME.Plugin.Create');
+        $assert_plugin_privilege->($id, 'Sys.ACME.Plugin.Secret.Modify')
+            if defined($param->{$secret_property});
 
         cfs_lock_file(
             $plugin_config_file,
@@ -173,9 +212,7 @@ __PACKAGE__->register_method({
     path => '{id}',
     method => 'PUT',
     description => "Update ACME plugin configuration.",
-    permissions => {
-        check => ['perm', '/', ['Sys.Modify']],
-    },
+    permissions => $plugin_permissions,
     protected => 1,
     parameters => PVE::ACME::Challenge->updateSchema(),
     returns => {
@@ -187,6 +224,16 @@ __PACKAGE__->register_method({
         my $id = extract_param($param, 'id');
         my $delete = extract_param($param, 'delete');
         my $digest = extract_param($param, 'digest');
+
+        # A request that changes the credentials needs the secret privilege. A
+        # request that changes another property, or no property, needs the
+        # modify privilege.
+        my @changed_properties = (keys %$param, PVE::Tools::split_list($delete // ''));
+        my $changes_secret = grep { $_ eq $secret_property } @changed_properties;
+        my $changes_other = grep { $_ ne $secret_property } @changed_properties;
+        $assert_plugin_privilege->($id, 'Sys.ACME.Plugin.Secret.Modify') if $changes_secret;
+        $assert_plugin_privilege->($id, 'Sys.ACME.Plugin.Modify')
+            if $changes_other || !$changes_secret;
 
         cfs_lock_file(
             $plugin_config_file,
@@ -230,9 +277,7 @@ __PACKAGE__->register_method({
     path => '{id}',
     method => 'DELETE',
     description => "Delete ACME plugin configuration.",
-    permissions => {
-        check => ['perm', '/', ['Sys.Modify']],
-    },
+    permissions => $plugin_permissions,
     protected => 1,
     parameters => {
         additionalProperties => 0,
@@ -247,6 +292,8 @@ __PACKAGE__->register_method({
         my ($param) = @_;
 
         my $id = extract_param($param, 'id');
+
+        $assert_plugin_privilege->($id, 'Sys.ACME.Plugin.Remove');
 
         cfs_lock_file(
             $plugin_config_file,
