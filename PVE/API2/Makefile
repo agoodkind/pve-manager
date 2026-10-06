@@ -14,6 +14,7 @@ PERLSOURCE = 			\
 	Cluster.pm		\
 	HAConfig.pm		\
 	Hardware.pm		\
+	KernelModules.pm	\
 	Network.pm		\
 	NodeConfig.pm		\
 	Nodes.pm		\
