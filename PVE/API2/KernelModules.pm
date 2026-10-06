@@ -49,17 +49,21 @@ my $modinfo_path = sub {
     my ($name) = @_;
 
     my $output = '';
+    my $errors = '';
     eval {
         run_command(
             [$MODINFO_COMMAND, '-n', '--', $name],
             outfunc => sub { $output .= shift() . "\n" },
-            errfunc => sub { },
+            errfunc => sub { $errors .= shift() . "\n" },
         );
     };
-    return undef if $@;
+    my $failed = $@ ? 1 : 0;
+
+    $errors =~ s/^\s+|\s+$//g;
+    return (undef, $errors) if $failed;
 
     $output =~ s/^\s+|\s+$//g;
-    return $output;
+    return ($output, $errors);
 };
 
 my $validate_name = sub {
@@ -72,9 +76,12 @@ my $validate_name = sub {
     die "Kernel module '$untainted' is not in $ALLOW_FILE.\n"
         if !$allowed->{$untainted};
 
-    my $path = $modinfo_path->($untainted);
-    die "The validator rejects kernel module '$untainted' because modinfo -n fails or returns no path for the running kernel.\n"
-        if !defined($path) || $path eq '';
+    my ($path, $errors) = $modinfo_path->($untainted);
+    if (!defined($path) || $path eq '') {
+        my $message = "The validator rejects kernel module '$untainted' because modinfo -n fails or returns no path for the running kernel.";
+        $message .= " The modinfo command wrote to stderr: $errors" if $errors ne '';
+        die "$message\n";
+    }
     die "Kernel module '$untainted' is built into the running kernel.\n"
         if $path eq $BUILTIN_MARKER;
 
@@ -153,15 +160,29 @@ __PACKAGE__->register_method({
             push @$names, $name;
         }
 
+        for my $name (@$names) {
+            my $errors = '';
+            eval {
+                run_command(
+                    [$MODPROBE_COMMAND, '--', $name],
+                    errfunc => sub { $errors .= shift() . "\n" },
+                );
+            };
+            if ($@) {
+                my $failure = $@;
+                $errors =~ s/^\s+|\s+$//g;
+                $failure =~ s/^\s+|\s+$//g;
+                my $detail = $errors;
+                $detail = $failure if $detail eq '';
+                die "The modprobe command failed for kernel module '$name': $detail\n";
+            }
+        }
+
         my $content = '';
         for my $name (@$names) {
             $content .= "$name\n";
         }
         PVE::File::file_set_contents($LOAD_FILE, $content, $LOAD_FILE_MODE);
-
-        for my $name (@$names) {
-            run_command([$MODPROBE_COMMAND, '--', $name]);
-        }
 
         return $read_state->();
     },

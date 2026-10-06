@@ -27,6 +27,10 @@ SCRIPT
 my $modprobe_script = <<"SCRIPT";
 #!/bin/sh
 echo "\$2" >> "$root/modprobe.log"
+if [ "\$2" = "fail_mod" ]; then
+    echo "modprobe: FATAL: Module fail_mod cannot be inserted." >&2
+    exit 1
+fi
 SCRIPT
 
 sub write_file {
@@ -41,7 +45,7 @@ write_file("$root/modinfo", $modinfo_script, 0755);
 write_file("$root/modprobe", $modprobe_script, 0755);
 write_file(
     "$root/allow",
-    "loaded_mod\nunloaded_mod\nbuiltin_mod\nmissing_mod\nsecond_mod\n",
+    "loaded_mod\nunloaded_mod\nbuiltin_mod\nmissing_mod\nsecond_mod\nfail_mod\n",
     0644,
 );
 
@@ -92,6 +96,11 @@ assert_rejected(
     'builtin module',
 );
 assert_rejected(['missing_mod'], qr/'missing_mod'.*modinfo -n fails/, 'module without modinfo');
+assert_rejected(
+    ['missing_mod'],
+    qr/modinfo: ERROR: Module missing_mod not found\./,
+    'modinfo failure includes its stderr',
+);
 
 my $state = put_modules(['loaded_mod', 'unloaded_mod', 'loaded_mod']);
 is(
@@ -116,6 +125,26 @@ is_deeply(
 
 $state = put_modules(['second_mod']);
 is(read_file($PVE::API2::KernelModules::LOAD_FILE), "second_mod\n", 'PUT replaces the list');
+
+my $before_failure = read_file($PVE::API2::KernelModules::LOAD_FILE);
+unlink("$root/modprobe.log");
+eval { put_modules(['loaded_mod', 'fail_mod']) };
+like($@, qr/fail_mod/, 'a modprobe failure error includes the module name');
+like(
+    $@,
+    qr/modprobe: FATAL: Module fail_mod cannot be inserted\./,
+    'a modprobe failure error includes the modprobe stderr',
+);
+is(
+    read_file($PVE::API2::KernelModules::LOAD_FILE),
+    $before_failure,
+    'a modprobe failure keeps the load file unchanged',
+);
+is(
+    read_file("$root/modprobe.log"),
+    "loaded_mod\nfail_mod\n",
+    'modprobe runs in request order until the failure',
+);
 
 $state = put_modules([]);
 is(read_file($PVE::API2::KernelModules::LOAD_FILE), '', 'an empty list empties the load file');
