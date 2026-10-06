@@ -64,17 +64,17 @@ my $modinfo_path = sub {
 my $validate_name = sub {
     my ($name, $allowed) = @_;
 
-    die "kernel module '$name': the name does not match ^[a-z0-9_]+\$\n"
+    die "Kernel module '$name' does not match the required pattern ^[a-z0-9_]+\$.\n"
         if $name !~ /^([a-z0-9_]+)\z/;
     my $untainted = $1;
 
-    die "kernel module '$untainted': the name is not in $ALLOW_FILE\n"
+    die "Kernel module '$untainted' is not in $ALLOW_FILE.\n"
         if !$allowed->{$untainted};
 
     my $path = $modinfo_path->($untainted);
-    die "kernel module '$untainted': modinfo -n fails for the running kernel\n"
+    die "The validator rejects kernel module '$untainted' because modinfo -n fails or returns no path for the running kernel.\n"
         if !defined($path) || $path eq '';
-    die "kernel module '$untainted': the module is built into the running kernel\n"
+    die "Kernel module '$untainted' is built into the running kernel.\n"
         if $path eq $BUILTIN_MARKER;
 
     return $untainted;
@@ -85,12 +85,12 @@ my $state_returns = {
     properties => {
         modules => {
             type => 'array',
-            description => 'The module names in the persistent list, in file order.',
+            description => 'The response lists persistent module names in file order.',
             items => { type => 'string' },
         },
         loaded => {
             type => 'object',
-            description => 'One entry per listed module: 1 when the module is loaded.',
+            description => 'The response reports whether each listed module is loaded (1) or is not loaded (0).',
             additionalProperties => { type => 'integer', minimum => 0, maximum => 1 },
         },
     },
@@ -100,7 +100,7 @@ __PACKAGE__->register_method({
     name => 'get_kernel_modules',
     path => '',
     method => 'GET',
-    description => "Get the persistent kernel module list of a node.",
+    description => "GET returns the persistent kernel module list and a loaded flag for each module on the node.",
     permissions => {
         check => ['perm', '/nodes/{node}', ['Sys.KernelModules.Audit']],
     },
@@ -121,7 +121,7 @@ __PACKAGE__->register_method({
     name => 'set_kernel_modules',
     path => '',
     method => 'PUT',
-    description => "Set the persistent kernel module list of a node and load the modules.",
+    description => "PUT replaces the persistent kernel module list and loads accepted modules on the node. PUT never unloads modules.",
     permissions => {
         check => ['perm', '/nodes/{node}', ['Sys.KernelModules.Modify']],
     },
@@ -133,7 +133,7 @@ __PACKAGE__->register_method({
             node => get_standard_option('pve-node'),
             modules => {
                 type => 'array',
-                description => 'The module names for the persistent list.',
+                description => 'The request supplies module names to replace the persistent list.',
                 items => { type => 'string' },
             },
         },
