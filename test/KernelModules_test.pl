@@ -130,6 +130,34 @@ eval { PVE::API2::KernelModules->set_kernel_modules({ node => 'localhost' }) };
 like($@, qr/modules/, 'the schema rejects a request without modules');
 is(read_file($PVE::API2::KernelModules::LOAD_FILE), "loaded_mod\n", 'rejected shapes keep the file');
 
+write_file(
+    $PVE::API2::KernelModules::LOAD_FILE,
+    "# managed by hand\nloaded_mod\n; disabled\n  # indented comment\nunloaded_mod\n\n",
+    0644,
+);
+is_deeply(
+    PVE::API2::KernelModules->get_kernel_modules({ node => 'localhost' }),
+    {
+        modules => ['loaded_mod', 'unloaded_mod'],
+        loaded => { loaded_mod => 1, unloaded_mod => 0 },
+    },
+    'GET skips comment lines that start with # or ;',
+);
+
+write_file(
+    $PVE::API2::KernelModules::ALLOW_FILE,
+    "# allowed modules\nloaded_mod\n; more modules\nunloaded_mod\n",
+    0644,
+);
+$state = put_modules(['loaded_mod', 'unloaded_mod']);
+is_deeply(
+    $state->{modules},
+    ['loaded_mod', 'unloaded_mod'],
+    'an allowlist with comment lines still accepts its module entries',
+);
+assert_rejected(['# allowed modules'], qr/'# allowed modules'/, 'allowlist comment text');
+assert_rejected(['; more modules'], qr/'; more modules'/, 'allowlist semicolon comment text');
+
 unlink($PVE::API2::KernelModules::ALLOW_FILE);
 assert_rejected(['loaded_mod'], qr/'loaded_mod'.*not in /, 'a missing allowlist is empty');
 

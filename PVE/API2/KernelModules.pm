@@ -28,7 +28,8 @@ my $read_names = sub {
     my $names = [];
     for my $line (split(/\n/, PVE::File::file_get_contents($path))) {
         $line =~ s/^\s+|\s+$//g;
-        push @$names, $line if $line ne '';
+        next if $line eq '' || $line =~ /^[#;]/;
+        push @$names, $line;
     }
     return $names;
 };
