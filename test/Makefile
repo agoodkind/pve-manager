@@ -5,7 +5,11 @@ all:
 export PERLLIB=..
 
 .PHONY: check
-check: test-replication test-balloon test-vzdump test-osd test-ceph-health test-ceph-services test-ceph-auth test-ceph-key-migration test-ceph-lockbox-migration test-custom-cpu-models test-pvesh
+check: test-replication test-balloon test-vzdump test-osd test-ceph-health test-ceph-services test-ceph-auth test-ceph-key-migration test-ceph-lockbox-migration test-custom-cpu-models test-pvesh test-kernel-modules
+
+.PHONY: test-kernel-modules
+test-kernel-modules:
+	./KernelModules_test.pl
 
 .PHONY: test-balloon
 test-balloon:
