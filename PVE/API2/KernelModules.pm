@@ -9,13 +9,11 @@ use PVE::Tools qw(run_command);
 
 use base qw(PVE::RESTHandler);
 
-use vars qw($LOAD_FILE $ALLOW_FILE $SYS_MODULE_DIR $MODINFO_COMMAND $MODPROBE_COMMAND);
-
-$LOAD_FILE = '/etc/modules-load.d/pve-overlay.conf';
-$ALLOW_FILE = '/etc/pve-overlay/kernel-modules.allow';
-$SYS_MODULE_DIR = '/sys/module';
-$MODINFO_COMMAND = '/sbin/modinfo';
-$MODPROBE_COMMAND = '/sbin/modprobe';
+my $LOAD_FILE = '/etc/modules-load.d/pve-overlay.conf';
+my $ALLOW_FILE = '/etc/pve-overlay/kernel-modules.allow';
+my $SYS_MODULE_DIR = '/sys/module';
+my $MODINFO_COMMAND = '/sbin/modinfo';
+my $MODPROBE_COMMAND = '/sbin/modprobe';
 
 my $LOAD_FILE_MODE = 0644;
 my $BUILTIN_MARKER = '(builtin)';
