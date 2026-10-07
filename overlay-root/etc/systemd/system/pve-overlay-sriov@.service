@@ -1,0 +1,13 @@
+[Unit]
+Description=Declare the SR-IOV virtual functions of %I
+After=network-pre.target
+Wants=network-pre.target
+Before=pve-guests.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/bin/perl -T /usr/share/pve-overlay/sriov-apply %i
+
+[Install]
+WantedBy=multi-user.target

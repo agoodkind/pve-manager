@@ -1,0 +1,13 @@
+#!/usr/bin/perl -T
+
+use strict;
+use warnings;
+
+use PVE::API2::SRIOV;
+
+$ENV{PATH} = '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin';
+delete @ENV{qw(IFS CDPATH ENV BASH_ENV)};
+
+die "usage: sriov-apply <ifname>\n" if scalar(@ARGV) != 1;
+
+PVE::API2::SRIOV->apply_saved($ARGV[0]);

@@ -55,6 +55,7 @@ use PVE::API2::LXC;
 use PVE::API2::Network;
 use PVE::API2::Network::SDN::Nodes::Status;
 use PVE::API2::NodeConfig;
+use PVE::API2::SRIOV;
 use PVE::API2::Qemu::CPU;
 use PVE::API2::Qemu;
 use PVE::API2::Replication;
@@ -203,6 +204,11 @@ __PACKAGE__->register_method({
 __PACKAGE__->register_method({
     subclass => "PVE::API2::KernelModules",
     path => 'kernel-modules',
+});
+
+__PACKAGE__->register_method({
+    subclass => "PVE::API2::SRIOV",
+    path => 'sriov',
 });
 
 __PACKAGE__->register_method({

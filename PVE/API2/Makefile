@@ -21,6 +21,7 @@ PERLSOURCE = 			\
 	Pool.pm			\
 	Replication.pm		\
 	ReplicationConfig.pm	\
+	SRIOV.pm		\
 	Services.pm		\
 	Subscription.pm		\
 	Tasks.pm		\
