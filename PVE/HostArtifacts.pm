@@ -73,8 +73,10 @@ my $SECRET_FIELD_RE = qr/[A-Z_][A-Z0-9_]{0,63}/;
 my $UNIT_RE = qr/[A-Za-z0-9][A-Za-z0-9@._:-]{0,246}\.service/;
 my $VERSION_RE = qr/[1-9][0-9]{0,15}/;
 
-my $POLICY_KEYS =
-    [qw(workspace node environment configuration directories files secret_fields)];
+my $POLICY_KEYS = [
+    qw(workspace node environment configuration directories parent_directories files
+        secret_fields)
+];
 my $SECRET_FIELD_KEYS =
     [qw(name storage_path mode owner group pattern min_length max_length consumer_units)];
 my $CONFIGURATION_KEYS =
@@ -206,6 +208,33 @@ my $check_entries = sub {
     my $entries = {};
     for my $index (0 .. $#$list) {
         my $entry = $check_entry->($list->[$index], "$label\[$index\]");
+        die "$label lists '$entry->{path}' more than once\n" if $entries->{ $entry->{path} };
+        $entries->{ $entry->{path} } = $entry;
+    }
+    return $entries;
+};
+
+# The function validates the inspect-only parent directories of a policy. An entry has a path.
+# The entry must list all three of mode, owner, and group or must not list any of them.
+my $check_parent_entries = sub {
+    my ($list, $label) = @_;
+
+    die "$label is not a JSON array\n" if ref($list) ne 'ARRAY';
+    my $entries = {};
+    for my $index (0 .. $#$list) {
+        my $raw = $list->[$index];
+        my $entry_label = "$label\[$index\]";
+        $check_keys->($raw, $ENTRY_KEYS, $entry_label);
+        my $entry = { path => $check_destination->($raw->{path}, "$entry_label path") };
+        my @present = grep { exists($raw->{$_}) } qw(mode owner group);
+        if (@present) {
+            die "$entry_label must list all three of mode, owner, and group or must not list"
+                . " any of them\n"
+                if scalar(@present) != 3;
+            $entry->{mode} = $check_string->($raw, 'mode', $MODE_RE, $entry_label);
+            $entry->{owner} = $check_string->($raw, 'owner', $ACCOUNT_RE, $entry_label);
+            $entry->{group} = $check_string->($raw, 'group', $ACCOUNT_RE, $entry_label);
+        }
         die "$label lists '$entry->{path}' more than once\n" if $entries->{ $entry->{path} };
         $entries->{ $entry->{path} } = $entry;
     }
@@ -375,12 +404,23 @@ sub load_policy {
     }
 
     my $directories = $check_entries->($document->{directories}, "$label directories");
+    my $parents = $check_parent_entries->(
+        $document->{parent_directories} // [], "$label parent_directories",
+    );
     my $files = $check_entries->($document->{files}, "$label files");
     for my $path (sort keys %$files) {
-        die "$label lists '$path' as a file and as a directory\n" if $directories->{$path};
+        die "$label lists '$path' as a file and as a directory\n"
+            if $directories->{$path} || $parents->{$path};
+    }
+    for my $path (sort keys %$parents) {
+        die "$label lists '$path' in directories and in parent_directories\n"
+            if $directories->{$path};
     }
     my $secret_fields = $check_secret_fields->(
-        $document->{secret_fields} // [], "$label secret_fields", $files, $directories,
+        $document->{secret_fields} // [],
+        "$label secret_fields",
+        $files,
+        { %$directories, %$parents },
     );
 
     return {
@@ -391,6 +431,7 @@ sub load_policy {
         environment => $check_string->($document, 'environment', $ENVIRONMENT_RE, $label),
         configuration => $checked_configuration,
         directories => $directories,
+        parents => $parents,
         files => $files,
         secret_fields => $secret_fields,
     };
@@ -964,8 +1005,16 @@ sub validate_archive {
     $compare_field->('node', $manifest->{node}, PVE::INotify::nodename());
     $compare_field->('environment', $manifest->{environment}, $policy->{environment});
 
-    my $directories = $check_entries->($manifest->{directories}, "$label directories");
-    for my $path (sort keys %$directories) {
+    my $listed = $check_entries->($manifest->{directories}, "$label directories");
+    my $directories = {};
+    my $inspected = {};
+    for my $path (sort keys %$listed) {
+        # A manifest directory that the policy lists as an inspect-only parent stays as it is.
+        if ($policy->{parents}->{$path}) {
+            $inspected->{$path} = 1;
+            next;
+        }
+        $directories->{$path} = $listed->{$path};
         my $allowed = $policy->{directories}->{$path};
         die "the policy does not list the directory $path\n" if !$allowed;
         die "the directory $path does not match the mode, owner, and group in the policy\n"
@@ -1020,6 +1069,7 @@ sub validate_archive {
     return {
         manifest_sha256 => Digest::SHA::sha256_hex($manifest_content),
         directories => $directories,
+        inspected => $inspected,
         files => $files,
     };
 }
@@ -1064,11 +1114,35 @@ my $observation_matches = sub {
     return 1;
 };
 
-# Each existing parent of the path must be a directory. A parent that the manifest does not
-# list must exist, belong to root, and must not be writable by the group or other users.
-# A parent that the manifest lists may be missing, and the policy sets its owner and mode.
+# The function checks an inspect-only parent directory and never changes it. The directory
+# must exist. With mode, owner, and group in the policy, it must have exactly these values.
+# Without them, it must belong to root. The group and other users cannot write to it.
+my $check_parent_directory = sub {
+    my ($entry) = @_;
+
+    my $path = $entry->{path};
+    my @stat = lstat($path);
+    die "the inspect-only parent directory $path does not exist\n" if !@stat;
+    die "the inspect-only parent directory $path is not a directory\n" if !S_ISDIR($stat[2]);
+    if (defined($entry->{mode})) {
+        my ($uid, $gid) = $account_ids->($entry->{owner}, $entry->{group});
+        my $mode = sprintf('%04o', S_IMODE($stat[2]));
+        die "the inspect-only parent directory $path has mode $mode, owner $stat[4], and"
+            . " group $stat[5], and the policy requires $entry->{mode}, $uid, and $gid\n"
+            if $mode ne $entry->{mode} || $stat[4] != $uid || $stat[5] != $gid;
+        return;
+    }
+    die "the inspect-only parent directory $path must belong to root\n" if $stat[4] != 0;
+    die "the group or other users can write to the inspect-only parent directory $path\n"
+        if $stat[2] & 022;
+};
+
+# Each existing parent of the path must be a directory. A parent that the manifest lists as an
+# owned directory may be missing, and the policy sets its owner and mode. The function checks
+# a parent that the policy lists as inspect-only against the policy. Every other parent must
+# exist and belong to root. The group and other users cannot write to it.
 my $check_ancestors = sub {
-    my ($path, $declared) = @_;
+    my ($path, $declared, $parents) = @_;
 
     my $current = '';
     for my $component (split(m{/}, substr(dirname($path), 1))) {
@@ -1077,6 +1151,10 @@ my $check_ancestors = sub {
         if ($declared->{$current}) {
             die "the parent directory $current of $path is not a directory\n"
                 if @stat && !S_ISDIR($stat[2]);
+            next;
+        }
+        if ($parents->{$current}) {
+            $check_parent_directory->($parents->{$current});
             next;
         }
         die "the parent directory $current of $path does not exist\n" if !@stat;
@@ -1253,9 +1331,14 @@ my $journal_copy = sub {
     return $copies;
 };
 
+# The function plans changes only for the directories that the policy lets this target own.
+# It checks each inspect-only parent that the manifest lists and does not plan a change for it.
 my $plan_directories = sub {
-    my ($validated) = @_;
+    my ($policy, $validated) = @_;
 
+    for my $path (sort keys %{ $validated->{inspected} }) {
+        $check_parent_directory->($policy->{parents}->{$path});
+    }
     my $directories = [];
     my $declared = { map { $_ => 1 } keys %{ $validated->{directories} } };
     for my $path (sort keys %{ $validated->{directories} }) {
@@ -1283,7 +1366,7 @@ my $plan_directories = sub {
         push @$directories, $entry;
     }
     for my $entry (@$directories) {
-        $check_ancestors->($entry->{path}, $declared);
+        $check_ancestors->($entry->{path}, $declared, $policy->{parents});
     }
     return ($directories, $declared);
 };
@@ -1298,7 +1381,7 @@ my $plan_files = sub {
     my $records = [];
     for my $path (sort keys %{ $validated->{files} }) {
         my $desired = $validated->{files}->{$path};
-        $check_ancestors->($path, $declared);
+        $check_ancestors->($path, $declared, $policy->{parents});
         my $observation = observe_file($path);
         die "$path exists and is not a regular file\n"
             if $observation->{present} && !$observation->{regular};
@@ -1333,7 +1416,7 @@ my $plan_files = sub {
         my $observation = observe_file($path);
         next if !$observation->{present};
         die "$path exists and is not a regular file\n" if !$observation->{regular};
-        $check_ancestors->($path, $declared);
+        $check_ancestors->($path, $declared, $policy->{parents});
         push @$files, {
             path => $path,
             action => 'remove',
@@ -1435,7 +1518,7 @@ my $apply_archive = sub {
         $previous_files->{ $check_destination->($entry->{path}, 'installed path') } = $entry;
     }
 
-    my ($directories, $declared) = $plan_directories->($validated);
+    my ($directories, $declared) = $plan_directories->($policy, $validated);
     my ($files, $records) =
         $plan_files->($policy, $validated, $previous_files, $declared, $upid);
 
@@ -1775,7 +1858,7 @@ sub set_secret {
             }
 
             if (!$file_matches) {
-                $check_ancestors->($path, $policy->{directories});
+                $check_ancestors->($path, $policy->{directories}, $policy->{parents});
                 die "the parent directory of $path does not exist\n" if !-d dirname($path);
                 $next->{temporary} = $sibling_name->($path, 'new');
             }
