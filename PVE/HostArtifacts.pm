@@ -32,6 +32,12 @@ my $GH_TIMEOUT_SECONDS = 300;
 my $GH_STDERR_LIMIT = 4096;
 my $GH_POLL_SECONDS = 0.05;
 
+my $SYSTEMCTL_COMMAND = '/usr/bin/systemctl';
+my $UNIT_TIMEOUT_SECONDS = 300;
+my $UNIT_STDERR_LIMIT = 1024;
+my $SECRET_VALUE_MAX_LENGTH = 512;
+my $SECRET_PATTERN_MAX_LENGTH = 1024;
+
 my $LOCK_TIMEOUT_SECONDS = 10;
 my $STAGE_MAX_AGE_SECONDS = 3600;
 my $POLICY_MAX_BYTES = 1024 * 1024;
@@ -63,8 +69,14 @@ my $WORKFLOW_URI_RE = qr/https:\/\/[\x21-\x7e]{1,1024}/;
 my $SOURCE_REF_RE = qr/refs\/[\x21-\x7e]{1,1024}/;
 my $NAME_RE = qr/[A-Za-z0-9][A-Za-z0-9._-]{0,254}/;
 my $BASE64_RE = qr{(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?};
+my $SECRET_FIELD_RE = qr/[A-Z_][A-Z0-9_]{0,63}/;
+my $UNIT_RE = qr/[A-Za-z0-9][A-Za-z0-9@._:-]{0,246}\.service/;
+my $VERSION_RE = qr/[1-9][0-9]{0,15}/;
 
-my $POLICY_KEYS = [qw(workspace node environment configuration directories files)];
+my $POLICY_KEYS =
+    [qw(workspace node environment configuration directories files secret_fields)];
+my $SECRET_FIELD_KEYS =
+    [qw(name storage_path mode owner group pattern min_length max_length consumer_units)];
 my $CONFIGURATION_KEYS =
     [qw(repository workflow_uri source_ref signer_digest max_archive_bytes max_bundle_bytes)];
 my $ENTRY_KEYS = [qw(path mode owner group)];
@@ -252,6 +264,63 @@ my $check_root_owned = sub {
     }
 };
 
+# The function validates the secret fields of a policy. Each field has its own storage file
+# outside the policy files and directories. The function anchors the pattern at both ends.
+my $check_secret_fields = sub {
+    my ($list, $label, $files, $directories) = @_;
+
+    die "$label is not a JSON array\n" if ref($list) ne 'ARRAY';
+    my $fields = {};
+    my $paths = {};
+    for my $index (0 .. $#$list) {
+        my $raw = $list->[$index];
+        my $entry_label = "$label\[$index\]";
+        $check_keys->($raw, $SECRET_FIELD_KEYS, $entry_label);
+        my $name = $check_string->($raw, 'name', $SECRET_FIELD_RE, $entry_label);
+        die "$label lists the field $name more than once\n" if $fields->{$name};
+        my $path = $check_destination->($raw->{storage_path}, "$entry_label storage_path");
+        die "$label lists the storage path $path more than once\n" if $paths->{$path}++;
+        die "$entry_label storage_path $path is also a policy file or directory\n"
+            if $files->{$path} || $directories->{$path};
+
+        my $pattern_text = $check_string->(
+            $raw, 'pattern', qr/[^\0]{1,$SECRET_PATTERN_MAX_LENGTH}/s, $entry_label,
+        );
+        my $pattern = eval { qr/\A(?:$pattern_text)\z/ };
+        die "$entry_label pattern is not a valid regular expression\n" if !$pattern;
+        my $min_length = $check_count->($raw, 'min_length', $entry_label);
+        my $max_length = $check_count->($raw, 'max_length', $entry_label);
+        die "$entry_label needs 1 <= min_length <= max_length <= $SECRET_VALUE_MAX_LENGTH\n"
+            if $min_length < 1
+            || $min_length > $max_length
+            || $max_length > $SECRET_VALUE_MAX_LENGTH;
+
+        die "$entry_label consumer_units is not a JSON array\n"
+            if ref($raw->{consumer_units}) ne 'ARRAY';
+        my $units = [];
+        my $seen_units = {};
+        for my $unit (@{ $raw->{consumer_units} }) {
+            my $checked = $untaint->($unit, $UNIT_RE, "$entry_label consumer unit");
+            die "$entry_label lists the consumer unit $checked more than once\n"
+                if $seen_units->{$checked}++;
+            push @$units, $checked;
+        }
+
+        $fields->{$name} = {
+            name => $name,
+            path => $path,
+            mode => $check_string->($raw, 'mode', $MODE_RE, $entry_label),
+            owner => $check_string->($raw, 'owner', $ACCOUNT_RE, $entry_label),
+            group => $check_string->($raw, 'group', $ACCOUNT_RE, $entry_label),
+            pattern => $pattern,
+            min_length => $min_length,
+            max_length => $max_length,
+            consumer_units => $units,
+        };
+    }
+    return $fields;
+};
+
 sub policy_path {
     my ($target) = @_;
 
@@ -310,6 +379,9 @@ sub load_policy {
     for my $path (sort keys %$files) {
         die "$label lists '$path' as a file and as a directory\n" if $directories->{$path};
     }
+    my $secret_fields = $check_secret_fields->(
+        $document->{secret_fields} // [], "$label secret_fields", $files, $directories,
+    );
 
     return {
         target => $target,
@@ -320,6 +392,7 @@ sub load_policy {
         configuration => $checked_configuration,
         directories => $directories,
         files => $files,
+        secret_fields => $secret_fields,
     };
 }
 
@@ -1486,6 +1559,246 @@ sub install {
     );
 }
 
+my $secrets_path = sub {
+    my ($target) = @_;
+
+    return $target_dir->($target) . '/secrets.json';
+};
+
+# The secret record of a target maps each field to its version, the SHA-256 of the storage
+# file content, the consumer units that still need a restart, and the temporary file of an
+# unfinished write.
+my $read_secrets = sub {
+    my ($target) = @_;
+
+    my $path = $secrets_path->($target);
+    return { fields => {} } if !-e $path;
+    my $secrets = $decode_json_file->($path, $RECORD_MAX_BYTES);
+    die "$path is not valid\n"
+        if ref($secrets) ne 'HASH' || ref($secrets->{fields}) ne 'HASH';
+    return $secrets;
+};
+
+my $write_secrets = sub {
+    my ($target, $secrets) = @_;
+
+    $write_file_atomic->($secrets_path->($target), $json->encode($secrets), $STATE_FILE_MODE);
+};
+
+my $secret_states = sub {
+    my ($policy) = @_;
+
+    my $secrets = $read_secrets->($policy->{target});
+    my $states = [];
+    for my $name (sort keys %{ $policy->{secret_fields} }) {
+        my $descriptor = $policy->{secret_fields}->{$name};
+        my $observation = observe_file($descriptor->{path});
+        my $state = { field => $name, configured => $observation->{present} };
+        $state->{sha256} = $observation->{sha256} if defined($observation->{sha256});
+        my $record = $secrets->{fields}->{$name};
+        $state->{version} = $record->{version} if $record;
+        push @$states, $state;
+    }
+    return $states;
+};
+
+# The function checks a secret value against its policy field. The messages do not contain
+# the value.
+my $check_secret_value = sub {
+    my ($descriptor, $value) = @_;
+
+    my $name = $descriptor->{name};
+    die "the value of $name is missing\n" if !defined($value) || ref($value);
+    die "the value of $name is shorter than $descriptor->{min_length} or longer than"
+        . " $descriptor->{max_length} characters\n"
+        if length($value) < $descriptor->{min_length}
+        || length($value) > $descriptor->{max_length};
+    die "the value of $name contains a control character\n" if $value =~ m/[\x00-\x1f\x7f]/;
+    die "the value of $name does not match the pattern of the policy\n"
+        if $value !~ $descriptor->{pattern};
+};
+
+my $secret_descriptor = sub {
+    my ($policy, $field) = @_;
+
+    $field = $untaint->($field, $SECRET_FIELD_RE, 'field');
+    my $descriptor = $policy->{secret_fields}->{$field};
+    die "the policy of this target does not list the secret field $field\n" if !$descriptor;
+    return $descriptor;
+};
+
+# The function checks a secret request before the API starts a worker. The returned request
+# does not contain the value.
+sub check_secret_request {
+    my ($target, $field, $value, $version) = @_;
+
+    my $policy = load_policy($target);
+    check_node($policy);
+    my $descriptor = $secret_descriptor->($policy, $field);
+    $check_secret_value->($descriptor, $value);
+    return {
+        target => $policy->{target},
+        field => $descriptor->{name},
+        version => $untaint->($version, $VERSION_RE, 'version') + 0,
+    };
+}
+
+my $run_systemctl = sub {
+    my (@arguments) = @_;
+
+    my $output = '';
+    my $errors = '';
+    eval {
+        PVE::Tools::run_command(
+            [$SYSTEMCTL_COMMAND, @arguments],
+            outfunc => sub { $output .= shift() . "\n" },
+            errfunc => sub { $errors .= shift() . "\n" },
+            timeout => $UNIT_TIMEOUT_SECONDS,
+        );
+    };
+    if (my $failure = $@) {
+        $errors = substr($errors, 0, $UNIT_STDERR_LIMIT);
+        $errors =~ s/\s+\z//;
+        $failure =~ s/\s+\z//;
+        die "systemctl @arguments failed: $failure: $errors\n";
+    }
+    return $output;
+};
+
+# A unit counts as running when systemd reports it as active, activating, or reloading.
+my $unit_running = sub {
+    my ($unit) = @_;
+
+    my $state = $run_systemctl->('show', '--property=ActiveState', '--value', $unit);
+    return $state =~ m/\A(?:active|activating|reloading)\s*\z/ ? 1 : 0;
+};
+
+my $write_secret_file = sub {
+    my ($descriptor, $content, $temporary) = @_;
+
+    my $path = $descriptor->{path};
+    my ($uid, $gid) = $account_ids->($descriptor->{owner}, $descriptor->{group});
+    sysopen(my $handle, $temporary, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, $STATE_FILE_MODE)
+        or die "cannot create $temporary: $!\n";
+    $write_all->($handle, $content, $temporary);
+    chown($uid, $gid, $handle) or die "cannot change the owner of $temporary: $!\n";
+    chmod(oct($descriptor->{mode}), $handle) or die "cannot change the mode of $temporary: $!\n";
+    $handle->sync() or die "cannot sync $temporary: $!\n";
+    close($handle) or die "cannot close $temporary: $!\n";
+    rename($temporary, $path) or die "cannot rename $temporary to $path: $!\n";
+    $sync_dir->(dirname($path));
+};
+
+# The function sets one secret field in a task worker. A lower version fails. The same version
+# with another value fails. When the version and value match the record, the storage file
+# matches, and the record does not list a consumer restart, the task does not change anything.
+# Otherwise, the task records the version first and writes the storage file when its bytes,
+# mode, owner, or group differ. Before writing, the task records a restart for each consumer
+# unit that is running. The task then restarts each recorded unit. The record retains a failed
+# restart, and the next accepted request for the field restarts the unit.
+sub set_secret {
+    my ($target, $field, $value, $version, $upid) = @_;
+
+    my $policy = load_policy($target);
+    check_node($policy);
+    my $descriptor = $secret_descriptor->($policy, $field);
+    $check_secret_value->($descriptor, $value);
+    $version = $untaint->($version, $VERSION_RE, 'version') + 0;
+    my $name = $descriptor->{name};
+    my $path = $descriptor->{path};
+
+    return with_target_lock(
+        $policy->{target},
+        sub {
+            $ensure_target_dir->($policy->{target});
+            recover($policy->{target});
+            my $secrets = $read_secrets->($policy->{target});
+            my $record = $secrets->{fields}->{$name};
+
+            if ($record && defined($record->{temporary})) {
+                my $temporary = $journal_sibling->($path, $record->{temporary}, 'new');
+                $remove_path->($temporary);
+            }
+
+            my $content = encode_utf8("$name=$value\n");
+            my $sha256 = Digest::SHA::sha256_hex($content);
+            if ($record) {
+                die "version $version of $name is lower than the stored version"
+                    . " $record->{version}\n"
+                    if $version < $record->{version};
+                die "version $version of $name already has another value\n"
+                    if $version == $record->{version} && $record->{sha256} ne $sha256;
+            }
+
+            my ($uid, $gid) = $account_ids->($descriptor->{owner}, $descriptor->{group});
+            my $observation = observe_file($path);
+            die "$path exists and is not a regular file\n"
+                if $observation->{present} && !$observation->{regular};
+            my $file_matches = $observation_matches->(
+                $observation,
+                {
+                    sha256 => $sha256,
+                    size => length($content),
+                    mode => $descriptor->{mode},
+                    uid => $uid,
+                    gid => $gid,
+                },
+            );
+
+            # A recorded restart counts only for a unit that the policy still lists.
+            my $declared = { map { $_ => 1 } @{ $descriptor->{consumer_units} } };
+            my $pending = {};
+            for my $unit (@{ $record ? $record->{pending} // [] : [] }) {
+                my $checked = $untaint->($unit, $UNIT_RE, 'recorded consumer unit');
+                $pending->{$checked} = 1 if $declared->{$checked};
+            }
+            if (!$file_matches) {
+                for my $unit (@{ $descriptor->{consumer_units} }) {
+                    if ($unit_running->($unit)) {
+                        $pending->{$unit} = 1;
+                    } else {
+                        print "the consumer unit $unit is not running, and the task does not"
+                            . " start it\n";
+                    }
+                }
+            }
+            my $next = {
+                version => $version,
+                sha256 => $sha256,
+                pending => [sort keys %$pending],
+            };
+
+            if ($file_matches && !%$pending && $record && $record->{version} == $version) {
+                print "the secret field $name already has version $version, and the task did"
+                    . " not change a file or a unit\n";
+                return;
+            }
+
+            if (!$file_matches) {
+                $check_ancestors->($path, $policy->{directories});
+                die "the parent directory of $path does not exist\n" if !-d dirname($path);
+                $next->{temporary} = $sibling_name->($path, 'new');
+            }
+            $secrets->{fields}->{$name} = $next;
+            $write_secrets->($policy->{target}, $secrets);
+
+            if (!$file_matches) {
+                $write_secret_file->($descriptor, $content, $next->{temporary});
+                delete $next->{temporary};
+                $write_secrets->($policy->{target}, $secrets);
+                print "the task wrote version $version of the secret field $name to $path\n";
+            }
+
+            for my $unit (sort keys %$pending) {
+                $run_systemctl->('restart', $unit);
+                print "the task restarted the consumer unit $unit\n";
+                $next->{pending} = [grep { $_ ne $unit } @{ $next->{pending} }];
+                $write_secrets->($policy->{target}, $secrets);
+            }
+        },
+    );
+}
+
 # The function returns the policy identity, the installed record, and the live state of each
 # installed file. Without an installed record, the files are the policy destinations. The
 # function does not change a file.
@@ -1530,6 +1843,7 @@ sub read_state {
         installed => $installed_fields,
         files => $files,
         observed_sha256 => Digest::SHA::sha256_hex($observed),
+        secrets => $secret_states->($policy),
     };
 }
 

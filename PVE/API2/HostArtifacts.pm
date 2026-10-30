@@ -8,6 +8,7 @@ use POSIX qw(SIGCHLD SIG_BLOCK SIG_UNBLOCK SIG_SETMASK sigprocmask);
 use PVE::HostArtifacts;
 use PVE::JSONSchema qw(get_standard_option);
 use PVE::RPCEnvironment;
+use PVE::Tools qw(extract_param);
 
 use base qw(PVE::RESTHandler);
 
@@ -16,6 +17,7 @@ use base qw(PVE::RESTHandler);
 # bytes. The worst case body of a 128 KiB base64 value is 384 KiB.
 my $CHUNK_BASE64_MAX_LENGTH = 128 * 1024;
 my $NAME_MAX_LENGTH = 255;
+my $SECRET_VALUE_MAX_LENGTH = 512;
 
 my $target_property = {
     type => 'string',
@@ -49,6 +51,36 @@ my $request_user = sub {
     my $user = $credentials->{userid};
     die "the authenticated user of the request is not available\n" if !defined($user);
     return $user;
+};
+
+# The function starts a task worker and returns its UPID. fork_worker waits for the worker with
+# a read that a SIGCHLD from an earlier worker interrupts, and then fails with "got no worker
+# upid". The function blocks SIGCHLD until fork_worker returns, and the signal arrives afterwards.
+my $start_worker = sub {
+    my ($type, $target, $user, $code) = @_;
+
+    my $rpcenv = PVE::RPCEnvironment::get();
+    my $sigchld = POSIX::SigSet->new(SIGCHLD);
+    my $previous_signals = POSIX::SigSet->new();
+    sigprocmask(SIG_BLOCK, $sigchld, $previous_signals)
+        or die "unable to block SIGCHLD: $!\n";
+    my $upid = eval {
+        $rpcenv->fork_worker(
+            $type,
+            $target,
+            $user,
+            sub {
+                my ($worker_upid) = @_;
+                sigprocmask(SIG_UNBLOCK, $sigchld);
+                $code->($worker_upid);
+            },
+        );
+    };
+    my $fork_error = $@;
+    sigprocmask(SIG_SETMASK, $previous_signals);
+    die $fork_error if $fork_error;
+
+    return $upid;
 };
 
 my $file_properties = {
@@ -184,35 +216,85 @@ __PACKAGE__->register_method({
     code => sub {
         my ($param) = @_;
 
-        my $rpcenv = PVE::RPCEnvironment::get();
         my $user = $request_user->();
         my $target = PVE::HostArtifacts::check_target($param->{target});
         my $request = PVE::HostArtifacts::check_install_request($target, $user, $param);
 
-        # fork_worker waits for the worker with a read that a SIGCHLD from an earlier worker
-        # interrupts, and then fails with "got no worker upid". SIGCHLD stays blocked until
-        # fork_worker returns, and the signal arrives afterwards.
-        my $sigchld = POSIX::SigSet->new(SIGCHLD);
-        my $previous_signals = POSIX::SigSet->new();
-        sigprocmask(SIG_BLOCK, $sigchld, $previous_signals)
-            or die "unable to block SIGCHLD: $!\n";
-        my $upid = eval {
-            $rpcenv->fork_worker(
-                'hostartifact',
-                $target,
-                $user,
-                sub {
-                    my ($worker_upid) = @_;
-                    sigprocmask(SIG_UNBLOCK, $sigchld);
-                    PVE::HostArtifacts::install($target, $request, $worker_upid, $user);
-                },
-            );
-        };
-        my $fork_error = $@;
-        sigprocmask(SIG_SETMASK, $previous_signals);
-        die $fork_error if $fork_error;
+        return $start_worker->(
+            'hostartifact',
+            $target,
+            $user,
+            sub {
+                my ($worker_upid) = @_;
+                PVE::HostArtifacts::install($target, $request, $worker_upid, $user);
+            },
+        );
+    },
+});
 
-        return $upid;
+__PACKAGE__->register_method({
+    name => 'set_host_secret',
+    path => '{target}/secrets/{field}',
+    method => 'PUT',
+    protected => 1,
+    proxyto => 'node',
+    expose_credentials => 1,
+    permissions => {
+        check => ['perm', '/nodes/{node}', ['Sys.HostSecrets.Modify']],
+    },
+    description => 'The hostsecret task writes one secret field of a target and restarts the'
+        . ' consumer units of the field when the storage file changes.',
+    parameters => {
+        additionalProperties => 0,
+        properties => {
+            node => get_standard_option('pve-node'),
+            target => $target_property,
+            field => {
+                type => 'string',
+                pattern => '[A-Z_][A-Z0-9_]{0,63}',
+                description => 'The value is the name of a secret field in the target policy.',
+            },
+            value => {
+                type => 'string',
+                maxLength => $SECRET_VALUE_MAX_LENGTH,
+                description => 'The value is the secret. Responses, errors, and task logs do'
+                    . ' not contain it.',
+            },
+            version => {
+                type => 'integer',
+                minimum => 1,
+                description => 'The value is the version of the secret.',
+            },
+        },
+    },
+    returns => {
+        type => 'string',
+        description => 'The value is the UPID of the hostsecret task.',
+    },
+    code => sub {
+        my ($param) = @_;
+
+        my $user = $request_user->();
+        my $value = extract_param($param, 'value');
+        my $request = PVE::HostArtifacts::check_secret_request(
+            $param->{target}, $param->{field}, $value, $param->{version},
+        );
+
+        return $start_worker->(
+            'hostsecret',
+            $request->{target},
+            $user,
+            sub {
+                my ($worker_upid) = @_;
+                PVE::HostArtifacts::set_secret(
+                    $request->{target},
+                    $request->{field},
+                    $value,
+                    $request->{version},
+                    $worker_upid,
+                );
+            },
+        );
     },
 });
 
@@ -281,6 +363,34 @@ __PACKAGE__->register_method({
                 type => 'string',
                 description => 'The value is the SHA-256 of the path, presence, SHA-256, size,'
                     . ' mode, owner, and group of every listed file.',
+            },
+            secrets => {
+                type => 'array',
+                description => 'The array has one entry for each secret field in the policy.'
+                    . ' An entry does not contain the secret.',
+                items => {
+                    type => 'object',
+                    properties => {
+                        field => {
+                            type => 'string',
+                            description => 'The value is the name of the secret field.',
+                        },
+                        configured => {
+                            type => 'boolean',
+                            description => 'The value is true when the storage file exists.',
+                        },
+                        version => {
+                            type => 'integer',
+                            optional => 1,
+                            description => 'The value is the recorded version of the field.',
+                        },
+                        sha256 => {
+                            type => 'string',
+                            optional => 1,
+                            description => 'The value is the SHA-256 of the storage file.',
+                        },
+                    },
+                },
             },
         },
     },
