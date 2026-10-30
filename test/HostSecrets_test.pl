@@ -126,7 +126,7 @@ sub secret_request {
         $rpcenv, $user, 'PUT', "$target/secrets/$field",
         { value => $value, version => $version },
     );
-    push @messages, $response->{message} // '';
+    push @messages, ($response->{message} // '') . $json->encode($response->{errors} // {});
     return $response;
 }
 
@@ -367,7 +367,7 @@ my $extra = HostArtifactsTest::api_request(
     $rpcenv, $SECRET_TOKEN, 'PUT', "$target/secrets/$FIELD",
     { value => value('three'), version => 3, mode => '0644' },
 );
-push @messages, $extra->{message} // '';
+push @messages, ($extra->{message} // '') . $json->encode($extra->{errors} // {});
 $check->('an extra parameter fails', $extra->{status} == 400);
 
 my $invalid_values = {
@@ -376,6 +376,7 @@ my $invalid_values = {
     quote => "$MARKER-'value'",
     '[email]' => "$MARKER-[email]-value",
     'too few characters' => 'short',
+    'more than 512 characters' => "$MARKER-" . ('a' x 520),
 };
 for my $label (sort keys %$invalid_values) {
     my $response =
@@ -441,24 +442,32 @@ $check_unrelated->('the failed restart and its retry');
 
 # The tests check an interrupted task and its recovery.
 
-HostArtifactsTest::write_file("$ROOT/state/hold", '');
-my $interrupted = secret_request($SECRET_TOKEN, $target, $FIELD, value('four'), 4);
-die "the secret request returned status $interrupted->{status}\n"
-    if $interrupted->{status} != 200;
-push @upids, $interrupted->{data};
-wait_for_state($CONSUMER, 'activating');
-my ($task) = PVE::Tools::upid_decode($interrupted->{data});
-die "the task has an unexpected process ID\n" if $task->{pid} !~ m/\A([0-9]+)\z/;
-my $task_pid = $1;
-kill('KILL', -$task_pid);
-HostArtifactsTest::wait_for_task($interrupted->{data});
-$check->(
-    'the stopped task leaves version 4 with the restart of the consumer',
-    secret_record($target, $FIELD)->{version} == 4
-        && join(',', @{ secret_record($target, $FIELD)->{pending} }) eq $CONSUMER,
-);
-unlink("$ROOT/state/hold") or die "cannot delete $ROOT/state/hold: $!\n";
-wait_for_state($CONSUMER, 'active');
+# The function starts a rotation, kills the task process group while the consumer restart
+# waits, and lets the consumer finish its start.
+sub interrupt_rotation {
+    my ($label, $version) = @_;
+
+    HostArtifactsTest::write_file("$ROOT/state/hold", '');
+    my $interrupted = secret_request($SECRET_TOKEN, $target, $FIELD, value($label), $version);
+    die "the secret request returned status $interrupted->{status}\n"
+        if $interrupted->{status} != 200;
+    push @upids, $interrupted->{data};
+    wait_for_state($CONSUMER, 'activating');
+    my ($task) = PVE::Tools::upid_decode($interrupted->{data});
+    die "the task has an unexpected process ID\n" if $task->{pid} !~ m/\A([0-9]+)\z/;
+    my $task_pid = $1;
+    kill('KILL', -$task_pid);
+    HostArtifactsTest::wait_for_task($interrupted->{data});
+    $check->(
+        "the stopped task records version $version and the consumer restart",
+        secret_record($target, $FIELD)->{version} == $version
+            && join(',', @{ secret_record($target, $FIELD)->{pending} }) eq $CONSUMER,
+    );
+    unlink("$ROOT/state/hold") or die "cannot delete $ROOT/state/hold: $!\n";
+    wait_for_state($CONSUMER, 'active');
+}
+
+interrupt_rotation('four', 4);
 $consumer_before = unit_property($CONSUMER, 'InvocationID');
 $status = set_secret($target, $FIELD, value('four'), 4);
 $check->('a retry of version 4 succeeds', $status eq 'OK', $status);
@@ -469,6 +478,34 @@ $check->(
 $check->('the consumer receives version 4', received() eq received_value('four'));
 $check->('the retry clears the restart', !@{ secret_record($target, $FIELD)->{pending} });
 $check_unrelated->('the interrupted task and its recovery');
+
+# The tests check a retry after an operator stops the consumer.
+
+interrupt_rotation('five', 5);
+run_systemctl('stop', $CONSUMER);
+$check->('the operator stops the consumer', unit_property($CONSUMER, 'ActiveState') eq 'inactive');
+my $stopped_response = secret_request($SECRET_TOKEN, $target, $FIELD, value('five'), 5);
+die "the secret request returned status $stopped_response->{status}\n"
+    if $stopped_response->{status} != 200;
+push @upids, $stopped_response->{data};
+my ($stopped_status, $stopped_log) = HostArtifactsTest::wait_for_task($stopped_response->{data});
+$check->('a retry of version 5 succeeds', $stopped_status eq 'OK', $stopped_status);
+$check->(
+    'the retry does not start the stopped consumer',
+    unit_property($CONSUMER, 'ActiveState') eq 'inactive',
+);
+$check_match->(
+    'the task log records the stopped consumer state',
+    $stopped_log,
+    qr/the consumer unit \Q$CONSUMER\E is inactive, and the task does not start it/,
+);
+$check->('the retry clears the restart', !@{ secret_record($target, $FIELD)->{pending} });
+$check->(
+    'the storage file contains version 5',
+    secret_state($target, $FIELD)->{sha256} eq content_sha($FIELD, value('five')),
+);
+run_systemctl('start', $CONSUMER);
+$check_unrelated->('the retry after an operator stop');
 
 # The tests check logs, responses, and records.
 

@@ -38,6 +38,13 @@ my $UNIT_STDERR_LIMIT = 1024;
 my $SECRET_VALUE_MAX_LENGTH = 512;
 my $SECRET_PATTERN_MAX_LENGTH = 1024;
 
+# org.freedesktop.systemd1(5) lists these ActiveState values. A consumer unit counts as running
+# in these states.
+my $RUNNING_STATES = { map { $_ => 1 } qw(active activating reloading refreshing) };
+# The task also restarts a failed unit because a failed restart of the field leaves the unit
+# failed. The task does not restart an inactive, deactivating, or maintenance unit.
+my $RESTART_STATES = { %$RUNNING_STATES, failed => 1 };
+
 my $LOCK_TIMEOUT_SECONDS = 10;
 my $STAGE_MAX_AGE_SECONDS = 3600;
 my $POLICY_MAX_BYTES = 1024 * 1024;
@@ -1748,12 +1755,12 @@ my $run_systemctl = sub {
     return $output;
 };
 
-# A unit counts as running when systemd reports it as active, activating, or reloading.
-my $unit_running = sub {
+my $unit_state = sub {
     my ($unit) = @_;
 
     my $state = $run_systemctl->('show', '--property=ActiveState', '--value', $unit);
-    return $state =~ m/\A(?:active|activating|reloading)\s*\z/ ? 1 : 0;
+    $state =~ s/\s+\z//;
+    return $state;
 };
 
 my $write_secret_file = sub {
@@ -1777,8 +1784,10 @@ my $write_secret_file = sub {
 # matches, and the record does not list a consumer restart, the task does not change anything.
 # Otherwise, the task records the version first and writes the storage file when its bytes,
 # mode, owner, or group differ. Before writing, the task records a restart for each consumer
-# unit that is running. The task then restarts each recorded unit. The record retains a failed
-# restart, and the next accepted request for the field restarts the unit.
+# unit that is running. The task then restarts each recorded unit that is running or failed.
+# It removes a recorded unit that is inactive, deactivating, or in maintenance from the record
+# without starting it. The record retains a failed restart. The next accepted request for the
+# field checks the state of the unit.
 sub set_secret {
     my ($target, $field, $value, $version, $upid) = @_;
 
@@ -1837,7 +1846,7 @@ sub set_secret {
             }
             if (!$file_matches) {
                 for my $unit (@{ $descriptor->{consumer_units} }) {
-                    if ($unit_running->($unit)) {
+                    if ($RUNNING_STATES->{ $unit_state->($unit) }) {
                         $pending->{$unit} = 1;
                     } else {
                         print "the consumer unit $unit is not running, and the task does not"
@@ -1873,8 +1882,13 @@ sub set_secret {
             }
 
             for my $unit (sort keys %$pending) {
-                $run_systemctl->('restart', $unit);
-                print "the task restarted the consumer unit $unit\n";
+                my $state = $unit_state->($unit);
+                if ($RESTART_STATES->{$state}) {
+                    $run_systemctl->('restart', $unit);
+                    print "the task restarted the consumer unit $unit\n";
+                } else {
+                    print "the consumer unit $unit is $state, and the task does not start it\n";
+                }
                 $next->{pending} = [grep { $_ ne $unit } @{ $next->{pending} }];
                 $write_secrets->($policy->{target}, $secrets);
             }
