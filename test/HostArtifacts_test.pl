@@ -201,9 +201,10 @@ sub stop_install {
 
 # The function writes the policy of a new target and returns the policy document and loaded policy.
 sub new_target {
-    my ($workspace, $files, $directories) = @_;
+    my ($workspace, $files, $directories, $parents) = @_;
 
     my $document = HostArtifactsTest::base_policy($workspace, $files, $directories);
+    $document->{parent_directories} = $parents if $parents;
     my $target = HostArtifactsTest::write_policy($document);
     return ($document, PVE::HostArtifacts::load_policy($target));
 }
@@ -1157,63 +1158,149 @@ $check->(
     $lock_state->{state} eq 'committed' && !grep { !$_->{matches} } @{ $lock_state->{files} },
 );
 
-# The tests check two targets that list the same directory.
+# The tests check two targets that share an inspect-only parent directory.
 
 my $shared_dir = "$ROOT/shared";
 make_path($shared_dir, { mode => 0700 });
 chmod(0700, $shared_dir) or die "cannot change the mode of $shared_dir: $!\n";
+my $shared_parent = [{ path => $shared_dir, mode => '0755', owner => 'root', group => 'root' }];
 my $shared_b_paths = numbered_paths($shared_dir, 'b');
 my $shared_a_file = "$shared_dir/a.conf";
-my ($shared_b_document, $shared_b_policy) = new_target(
-    'suburban/shared-b',
-    file_entries($shared_b_paths),
-    [{ path => $shared_dir, mode => '0755', owner => 'root', group => 'root' }],
-);
+my ($shared_b_document, $shared_b_policy) =
+    new_target('suburban/shared-b', file_entries($shared_b_paths), [], $shared_parent);
 my $shared_b_archive = write_artifact(
     'shared-b', HostArtifactsTest::artifact($shared_b_document, contents($shared_b_paths, 'b')),
 );
 my $shared_a_files = { $shared_a_file => { content => "a\n" } };
-my ($shared_a_document, $shared_a_policy) = new_target(
-    'suburban/shared-a',
-    file_entries([$shared_a_file]),
-    [{ path => $shared_dir, mode => '0750', owner => 'root', group => 'root' }],
-);
+my ($shared_a_document, $shared_a_policy) =
+    new_target('suburban/shared-a', file_entries([$shared_a_file]), [], $shared_parent);
 my $shared_a_archive =
     write_artifact('shared-a', HostArtifactsTest::artifact($shared_a_document, $shared_a_files));
 
-stop_install($shared_b_policy, $shared_b_archive, 'KILL', sub { -e $shared_b_paths->[0] });
-$check->(
-    'the install of target B stops with its directory mode',
-    -e journal_of($shared_b_policy) && directory_mode($shared_dir) eq '0755',
+$check_error->(
+    'the install fails when the inspect-only parent has another mode',
+    sub { install_archive($shared_b_policy, $shared_b_archive) },
+    qr/inspect-only parent directory \Q$shared_dir\E has mode 0700/,
 );
-install_archive($shared_a_policy, $shared_a_archive);
-$check->('target A sets its directory mode', directory_mode($shared_dir) eq '0750');
-recover_target($shared_b_policy);
 $check->(
-    'the rollback of target B keeps the directory mode that target A set',
-    directory_mode($shared_dir) eq '0750',
+    'the failed install does not write a file or a journal',
+    (!grep { -e $_ } @$shared_b_paths) && !-e journal_of($shared_b_policy),
 );
-$check->('the rollback of target B deletes its new files', !grep { -e $_ } @$shared_b_paths);
-$check->('the rollback of target B keeps the file of target A', -e $shared_a_file);
-
-$shared_a_document->{directories}->[0]->{mode} = '0755';
-HostArtifactsTest::write_policy($shared_a_document);
-$shared_a_policy = PVE::HostArtifacts::load_policy($shared_a_policy->{target});
-my $shared_a_same = write_artifact(
-    'shared-a-same', HostArtifactsTest::artifact($shared_a_document, $shared_a_files),
-);
-chmod(0700, $shared_dir) or die "cannot change the mode of $shared_dir: $!\n";
-stop_install($shared_b_policy, $shared_b_archive, 'KILL', sub { -e $shared_b_paths->[0] });
-install_archive($shared_a_policy, $shared_a_same);
-recover_target($shared_b_policy);
 $check->(
-    'the rollback of target B restores the mode that target B changed and target A also lists',
+    'the failed install leaves the parent mode unchanged',
     directory_mode($shared_dir) eq '0700',
 );
-install_archive($shared_a_policy, $shared_a_same);
+chmod(0755, $shared_dir) or die "cannot change the mode of $shared_dir: $!\n";
+chown(1, 1, $shared_dir) or die "cannot change the owner of $shared_dir: $!\n";
+$check_error->(
+    'the install fails when the inspect-only parent has another owner',
+    sub { install_archive($shared_b_policy, $shared_b_archive) },
+    qr/inspect-only parent directory \Q$shared_dir\E has mode 0755, owner 1/,
+);
 $check->(
-    'the next install of target A sets its directory mode again',
-    directory_mode($shared_dir) eq '0755',
+    'the failed install leaves the parent owner unchanged',
+    (lstat($shared_dir))[4] == 1 && !-e journal_of($shared_b_policy),
+);
+chown(0, 0, $shared_dir) or die "cannot change the owner of $shared_dir: $!\n";
+
+# The host owner sets the parent directory to the mode that both policies require.
+stop_install($shared_b_policy, $shared_b_archive, 'KILL', sub { -e $shared_b_paths->[0] });
+$check->('the install of target B stops with a journal', -e journal_of($shared_b_policy));
+install_archive($shared_a_policy, $shared_a_archive);
+my $shared_committed = $json->encode([(lstat($shared_dir))[2, 4, 5]]);
+my $shared_a_committed = snapshot($shared_a_file);
+recover_target($shared_b_policy);
+$check->(
+    'the recovery of target B leaves the parent of the committed target A unchanged',
+    $json->encode([(lstat($shared_dir))[2, 4, 5]]) eq $shared_committed
+        && directory_mode($shared_dir) eq '0755',
+);
+$check->('the recovery of target B deletes its new files', !grep { -e $_ } @$shared_b_paths);
+$check->(
+    'the recovery of target B leaves the file of target A unchanged',
+    snapshot($shared_a_file) eq $shared_a_committed,
+);
+my $shared_a_state = get_state($shared_a_policy->{target});
+$check->(
+    'GET reports every file of target A as matching',
+    $shared_a_state->{state} eq 'committed'
+        && !grep { !$_->{matches} } @{ $shared_a_state->{files} },
+);
+
+# The install does not change an inspect-only parent that the manifest lists as a directory.
+my $listed_document = { %$shared_a_document, directories => $shared_parent };
+my $listed_archive =
+    write_artifact('shared-listed', HostArtifactsTest::artifact($listed_document, $shared_a_files));
+my $listed_before = $json->encode([(lstat($shared_dir))[1, 2, 4, 5, 10]]);
+install_archive($shared_a_policy, $listed_archive);
+$check->(
+    'a manifest directory that the policy lists as inspect-only stays unchanged',
+    $json->encode([(lstat($shared_dir))[1, 2, 4, 5, 10]]) eq $listed_before,
+);
+my $listed_record = $json->decode(
+    HostArtifactsTest::read_file("$STATE_DIR/$shared_a_policy->{target}/installed.json"),
+);
+$check->(
+    'the installed record does not list the inspect-only directory',
+    !@{ $listed_record->{directories} },
+);
+
+# The policy lists an inspect-only parent without mode, owner, and group.
+my $plain_dir = "$ROOT/plain";
+make_path($plain_dir, { mode => 0755 });
+chmod(0775, $plain_dir) or die "cannot change the mode of $plain_dir: $!\n";
+my $plain_file = "$plain_dir/p.conf";
+my ($plain_document, $plain_policy) =
+    new_target('suburban/plain', file_entries([$plain_file]), [], [{ path => $plain_dir }]);
+my $plain_archive = write_artifact(
+    'plain', HostArtifactsTest::artifact($plain_document, { $plain_file => { content => "p\n" } }),
+);
+$check_error->(
+    'the install fails when the group can write to the inspect-only parent',
+    sub { install_archive($plain_policy, $plain_archive) },
+    qr/the group or other users can write to the inspect-only parent directory \Q$plain_dir\E\n/,
+);
+$check->('the failed install does not write the file', !-e $plain_file);
+chmod(0755, $plain_dir) or die "cannot change the mode of $plain_dir: $!\n";
+install_archive($plain_policy, $plain_archive);
+$check->('the install succeeds when root owns the inspect-only parent', -e $plain_file);
+
+# The recovery of an owned directory restores the change of the same target.
+my $owned_c_dir = "$ROOT/owned-c";
+make_path($owned_c_dir, { mode => 0700 });
+chmod(0700, $owned_c_dir) or die "cannot change the mode of $owned_c_dir: $!\n";
+my $owned_c_paths = numbered_paths($owned_c_dir, 'c');
+my ($owned_c_document, $owned_c_policy) = new_target(
+    'suburban/owned-c',
+    file_entries($owned_c_paths),
+    [{ path => $owned_c_dir, mode => '0750', owner => 'root', group => 'root' }],
+);
+my $owned_c_archive = write_artifact(
+    'owned-c', HostArtifactsTest::artifact($owned_c_document, contents($owned_c_paths, 'c')),
+);
+stop_install($owned_c_policy, $owned_c_archive, 'KILL', sub { -e $owned_c_paths->[0] });
+$check->(
+    'the install of an owned directory stops with the new mode',
+    -e journal_of($owned_c_policy) && directory_mode($owned_c_dir) eq '0750',
+);
+recover_target($owned_c_policy);
+$check->(
+    'the recovery restores the mode of the owned directory',
+    directory_mode($owned_c_dir) eq '0700',
+);
+
+# A policy cannot list one path as an owned directory and as an inspect-only parent.
+my $overlap_document = HostArtifactsTest::base_policy(
+    'suburban/overlap',
+    [],
+    [{ path => $plain_dir, mode => '0755', owner => 'root', group => 'root' }],
+);
+$overlap_document->{parent_directories} = [{ path => $plain_dir }];
+my $overlap_target = HostArtifactsTest::write_policy($overlap_document);
+$check_error->(
+    'policy loading rejects a path in directories and in parent_directories',
+    sub { PVE::HostArtifacts::load_policy($overlap_target) },
+    qr/in directories and in parent_directories/,
 );
 
 remove_tree($ROOT, $WORK);
