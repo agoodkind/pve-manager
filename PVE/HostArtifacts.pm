@@ -991,17 +991,21 @@ my $observation_matches = sub {
     return 1;
 };
 
-# Each directory from the root to the parent of the path must be a directory that belongs to
-# root and that the group and other users cannot write. A missing directory must be in
-# $created.
+# Each existing parent of the path must be a directory. A parent that the manifest does not
+# list must exist, belong to root, and must not be writable by the group or other users.
+# A parent that the manifest lists may be missing, and the policy sets its owner and mode.
 my $check_ancestors = sub {
-    my ($path, $created) = @_;
+    my ($path, $declared) = @_;
 
     my $current = '';
     for my $component (split(m{/}, substr(dirname($path), 1))) {
         $current .= "/$component";
-        next if $created->{$current};
         my @stat = lstat($current);
+        if ($declared->{$current}) {
+            die "the parent directory $current of $path is not a directory\n"
+                if @stat && !S_ISDIR($stat[2]);
+            next;
+        }
         die "the parent directory $current of $path does not exist\n" if !@stat;
         die "the parent directory $current of $path is not a directory\n" if !S_ISDIR($stat[2]);
         die "the parent directory $current of $path must belong to root\n" if $stat[4] != 0;
@@ -1061,6 +1065,41 @@ my $finish_journal = sub {
     $sync_dir->($target_dir->($target));
 };
 
+# The function restores the owner and the mode of an existing directory that the journal lists.
+# It restores only a value that this transaction changed, and only while the directory still
+# has the value that this transaction set.
+my $restore_directory = sub {
+    my ($entry, $directory) = @_;
+
+    my @stat = lstat($directory);
+    return if !@stat || !S_ISDIR($stat[2]);
+    if (defined($entry->{previous_uid})) {
+        my $uid = $untaint->($entry->{previous_uid}, qr/[0-9]+/, 'journal uid');
+        my $gid = $untaint->($entry->{previous_gid}, qr/[0-9]+/, 'journal gid');
+        my $set_uid = $untaint->($entry->{set_uid}, qr/[0-9]+/, 'journal uid');
+        my $set_gid = $untaint->($entry->{set_gid}, qr/[0-9]+/, 'journal gid');
+        if ($stat[4] == $set_uid && $stat[5] == $set_gid) {
+            chown($uid, $gid, $directory) or die "cannot restore the owner of $directory: $!\n";
+            print "recovery restored the owner of the directory $directory\n";
+        } else {
+            print "recovery kept the owner of the directory $directory because it differs from"
+                . " the owner that this transaction set\n";
+        }
+    }
+    if (defined($entry->{previous_mode})) {
+        my $mode = $untaint->($entry->{previous_mode}, qr/[0-7]{4}/, 'journal mode');
+        my $set_mode = $untaint->($entry->{set_mode}, qr/[0-7]{4}/, 'journal mode');
+        my @current = lstat($directory);
+        if (@current && sprintf('%04o', S_IMODE($current[2])) eq $set_mode) {
+            chmod(oct($mode), $directory) or die "cannot restore the mode of $directory: $!\n";
+            print "recovery restored the mode of the directory $directory\n";
+        } else {
+            print "recovery kept the mode of the directory $directory because it differs from"
+                . " the mode that this transaction set\n";
+        }
+    }
+};
+
 # The function completes or reverts the transaction of an incomplete journal. For a journal
 # in the committed phase, the function writes the installed record. For a journal in another
 # phase, the function restores each listed destination to its state before the transaction.
@@ -1118,13 +1157,7 @@ sub recover {
                 die "cannot delete the directory $directory: $!\n";
             }
         } else {
-            my @stat = lstat($directory);
-            next if !@stat || !S_ISDIR($stat[2]);
-            my $uid = $untaint->($entry->{previous_uid}, qr/[0-9]+/, 'journal uid');
-            my $gid = $untaint->($entry->{previous_gid}, qr/[0-9]+/, 'journal gid');
-            my $mode = $untaint->($entry->{previous_mode}, qr/0[0-7]{3,4}/, 'journal mode');
-            chown($uid, $gid, $directory) or die "cannot restore the owner of $directory: $!\n";
-            chmod(oct($mode), $directory) or die "cannot restore the mode of $directory: $!\n";
+            $restore_directory->($entry, $directory);
         }
         $changed_dirs->{ dirname($directory) } = 1;
     }
@@ -1151,47 +1184,48 @@ my $plan_directories = sub {
     my ($validated) = @_;
 
     my $directories = [];
-    my $created = {};
+    my $declared = { map { $_ => 1 } keys %{ $validated->{directories} } };
     for my $path (sort keys %{ $validated->{directories} }) {
         my $desired = $validated->{directories}->{$path};
         my @stat = lstat($path);
         if (!@stat) {
             die "cannot read $path: $!\n" if $! != ENOENT;
-            $created->{$path} = 1;
             push @$directories, { path => $path, created => 1, desired => $desired };
             next;
         }
         die "$path is not a directory\n" if !S_ISDIR($stat[2]);
+        my $entry = { path => $path, desired => $desired };
+        if ($stat[4] != $desired->{uid} || $stat[5] != $desired->{gid}) {
+            $entry->{previous_uid} = $stat[4];
+            $entry->{previous_gid} = $stat[5];
+            $entry->{set_uid} = $desired->{uid};
+            $entry->{set_gid} = $desired->{gid};
+        }
         my $mode = sprintf('%04o', S_IMODE($stat[2]));
-        next
-            if $mode eq $desired->{mode}
-            && $stat[4] == $desired->{uid}
-            && $stat[5] == $desired->{gid};
-        push @$directories, {
-            path => $path,
-            desired => $desired,
-            previous_mode => $mode,
-            previous_uid => $stat[4],
-            previous_gid => $stat[5],
-        };
+        if ($mode ne $desired->{mode}) {
+            $entry->{previous_mode} = $mode;
+            $entry->{set_mode} = $desired->{mode};
+        }
+        next if !defined($entry->{previous_uid}) && !defined($entry->{previous_mode});
+        push @$directories, $entry;
     }
     for my $entry (@$directories) {
-        $check_ancestors->($entry->{path}, $created);
+        $check_ancestors->($entry->{path}, $declared);
     }
-    return ($directories, $created);
+    return ($directories, $declared);
 };
 
 # The function returns the file actions and the installed file records. A file that matches
 # the manifest keeps its earlier write_id. Every changed file gets the UPID of this task as
 # its write_id.
 my $plan_files = sub {
-    my ($policy, $validated, $previous_files, $created, $upid) = @_;
+    my ($policy, $validated, $previous_files, $declared, $upid) = @_;
 
     my $files = [];
     my $records = [];
     for my $path (sort keys %{ $validated->{files} }) {
         my $desired = $validated->{files}->{$path};
-        $check_ancestors->($path, $created);
+        $check_ancestors->($path, $declared);
         my $observation = observe_file($path);
         die "$path exists and is not a regular file\n"
             if $observation->{present} && !$observation->{regular};
@@ -1226,7 +1260,7 @@ my $plan_files = sub {
         my $observation = observe_file($path);
         next if !$observation->{present};
         die "$path exists and is not a regular file\n" if !$observation->{regular};
-        $check_ancestors->($path, {});
+        $check_ancestors->($path, $declared);
         push @$files, {
             path => $path,
             action => 'remove',
@@ -1246,10 +1280,14 @@ my $prepare_files = sub {
             mkdir($entry->{path}, $STATE_DIR_MODE)
                 or die "cannot create the directory $entry->{path}: $!\n";
         }
-        chown($desired->{uid}, $desired->{gid}, $entry->{path})
-            or die "cannot change the owner of $entry->{path}: $!\n";
-        chmod(oct($desired->{mode}), $entry->{path})
-            or die "cannot change the mode of $entry->{path}: $!\n";
+        if ($entry->{created} || defined($entry->{previous_uid})) {
+            chown($desired->{uid}, $desired->{gid}, $entry->{path})
+                or die "cannot change the owner of $entry->{path}: $!\n";
+        }
+        if ($entry->{created} || defined($entry->{previous_mode})) {
+            chmod(oct($desired->{mode}), $entry->{path})
+                or die "cannot change the mode of $entry->{path}: $!\n";
+        }
         $sync_dir->(dirname($entry->{path}));
         print "prepared the directory $entry->{path}\n";
     }
@@ -1324,9 +1362,9 @@ my $apply_archive = sub {
         $previous_files->{ $check_destination->($entry->{path}, 'installed path') } = $entry;
     }
 
-    my ($directories, $created) = $plan_directories->($validated);
+    my ($directories, $declared) = $plan_directories->($validated);
     my ($files, $records) =
-        $plan_files->($policy, $validated, $previous_files, $created, $upid);
+        $plan_files->($policy, $validated, $previous_files, $declared, $upid);
 
     my $installed = {
         workspace => $policy->{workspace},
@@ -1365,8 +1403,8 @@ my $apply_archive = sub {
         directories => $journal_copy->($directories),
         files => $journal_copy->($files),
     };
-    $write_journal->($target, $journal);
     eval {
+        $write_journal->($target, $journal);
         $prepare_files->($directories, $files, $archive_path);
         $journal->{phase} = 'replacing';
         $write_journal->($target, $journal);
@@ -1381,7 +1419,8 @@ my $apply_archive = sub {
     };
     if (my $error = $@) {
         print "the transaction failed: $error";
-        recover($target);
+        eval { recover($target) };
+        die "${error}restoring the files of the transaction also failed: $@" if $@;
         die $error;
     }
     return $installed;
