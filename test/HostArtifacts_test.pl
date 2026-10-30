@@ -12,6 +12,7 @@ use lib qw(.. .);
 
 use Digest::SHA;
 use File::Path qw(make_path remove_tree);
+use MIME::Base64 qw(encode_base64);
 use POSIX qw();
 use Time::HiRes qw();
 
@@ -165,6 +166,74 @@ sub interrupt_install {
     kill('KILL', $pid);
     waitpid($pid, 0);
     return scalar(grep { HostArtifactsTest::read_file($_) =~ m/\Atwo / } @$paths);
+}
+
+# The function starts an install of $archive_path in a child process, sends $signal to the
+# child when $ready returns true, and returns the error of the child. The child dies on TERM,
+# as a task worker of fork_worker does.
+sub stop_install {
+    my ($policy, $archive_path, $signal, $ready) = @_;
+
+    pipe(my $reader, my $writer) or die "cannot create a pipe: $!\n";
+    my $pid = fork() // die "cannot fork: $!\n";
+    if (!$pid) {
+        close($reader);
+        open(STDOUT, '>', '/dev/null') or POSIX::_exit(2);
+        local $SIG{TERM} = sub { die "received interrupt\n" };
+        eval { install_archive($policy, $archive_path) };
+        print {$writer} ($@ // '');
+        close($writer);
+        POSIX::_exit(0);
+    }
+    close($writer);
+    my $deadline = Time::HiRes::time() + 120;
+    while (Time::HiRes::time() < $deadline) {
+        last if $ready->();
+        last if waitpid($pid, POSIX::WNOHANG()) == $pid;
+        Time::HiRes::sleep(0.0005);
+    }
+    kill($signal, $pid);
+    my $error = do { local $/ = undef; <$reader> } // '';
+    close($reader);
+    waitpid($pid, 0);
+    return $error;
+}
+
+# The function writes the policy of a new target and returns the policy document and loaded policy.
+sub new_target {
+    my ($workspace, $files, $directories) = @_;
+
+    my $document = HostArtifactsTest::base_policy($workspace, $files, $directories);
+    my $target = HostArtifactsTest::write_policy($document);
+    return ($document, PVE::HostArtifacts::load_policy($target));
+}
+
+sub directory_mode {
+    my ($path) = @_;
+
+    my @stat = lstat($path);
+    return 'absent' if !@stat;
+    return sprintf('%04o', $stat[2] & 07777);
+}
+
+sub file_entries {
+    my ($paths, %metadata) = @_;
+
+    return [map { { path => $_, mode => '0644', owner => 'root', group => 'root', %metadata } }
+        @$paths];
+}
+
+sub contents {
+    my ($paths, $prefix) = @_;
+
+    return { map { $_ => { content => "$prefix $_\n" } } @$paths };
+}
+
+sub count_with_prefix {
+    my ($paths, $prefix) = @_;
+
+    return scalar(grep { -e $_ && HostArtifactsTest::read_file($_) =~ m/\A\Q$prefix\E / }
+        @$paths);
 }
 
 # Workspace selectors and target identity.
@@ -794,6 +863,357 @@ my $empty_state = get_state($many_target);
 $check->(
     'an empty manifest leaves an empty installed record',
     $empty_state->{state} eq 'committed' && !@{ $empty_state->{files} },
+);
+
+sub recover_target {
+    my ($policy) = @_;
+
+    PVE::HostArtifacts::with_target_lock(
+        $policy->{target}, sub { PVE::HostArtifacts::recover($policy->{target}) },
+    );
+}
+
+sub journal_of {
+    my ($policy) = @_;
+
+    return "$STATE_DIR/$policy->{target}/journal.json";
+}
+
+sub numbered_paths {
+    my ($dir, $prefix) = @_;
+
+    return [map { sprintf('%s/%s-%04d.conf', $dir, $prefix, $_) } 1 .. $INTERRUPT_FILE_COUNT];
+}
+
+# The tests check recovery of an existing directory with a setgid bit.
+
+my $setgid_dir = "$ROOT/setgid";
+make_path($setgid_dir, { mode => 0755 });
+chmod(02755, $setgid_dir) or die "cannot change the mode of $setgid_dir: $!\n";
+my $setgid_paths = numbered_paths($setgid_dir, 'file');
+my ($setgid_document, $setgid_policy) = new_target(
+    'suburban/setgid',
+    file_entries($setgid_paths),
+    [{ path => $setgid_dir, mode => '0755', owner => 'root', group => 'root' }],
+);
+my $setgid_one = write_artifact(
+    'setgid-one', HostArtifactsTest::artifact($setgid_document, contents($setgid_paths, 'one')),
+);
+my $setgid_two = write_artifact(
+    'setgid-two', HostArtifactsTest::artifact($setgid_document, contents($setgid_paths, 'two')),
+);
+my $setgid_journal = journal_of($setgid_policy);
+stop_install($setgid_policy, $setgid_one, 'KILL', sub { -e $setgid_journal });
+$check->('the killed install leaves a journal', -e $setgid_journal);
+eval { recover_target($setgid_policy) };
+$check->('recovery accepts the journal mode of a setgid directory', !$@, $@);
+$check->('recovery restores the setgid mode', directory_mode($setgid_dir) eq '2755');
+$check->('recovery deletes the journal of the setgid directory', !-e $setgid_journal);
+$check->('recovery does not leave any new file', !grep { -e $_ } @$setgid_paths);
+install_archive($setgid_policy, $setgid_one);
+$check->('the next install sets the policy mode', directory_mode($setgid_dir) eq '0755');
+
+chmod(02755, $setgid_dir) or die "cannot change the mode of $setgid_dir: $!\n";
+my $stopped_error = stop_install($setgid_policy, $setgid_two, 'TERM', sub { -e $setgid_journal });
+$check_match->(
+    'a stopped install fails with its own error', $stopped_error, qr/\Areceived interrupt\n\z/,
+);
+$check->('a stopped install restores its files in the same task', !-e $setgid_journal);
+$check->(
+    'a stopped install restores the setgid mode', directory_mode($setgid_dir) eq '2755',
+);
+$check->(
+    'a stopped install keeps the earlier content',
+    count_with_prefix($setgid_paths, 'one') == $INTERRUPT_FILE_COUNT,
+);
+
+# The tests check rollback of new files and a created directory.
+
+my $fresh_dir = "$ROOT/fresh";
+my $fresh_paths = numbered_paths($fresh_dir, 'file');
+my ($fresh_document, $fresh_policy) = new_target(
+    'suburban/fresh',
+    file_entries($fresh_paths),
+    [{ path => $fresh_dir, mode => '0750', owner => 'root', group => 'root' }],
+);
+my $fresh_archive = write_artifact(
+    'fresh', HostArtifactsTest::artifact($fresh_document, contents($fresh_paths, 'one')),
+);
+stop_install($fresh_policy, $fresh_archive, 'KILL', sub { -e $fresh_paths->[0] });
+my $fresh_present = grep { -e $_ } @$fresh_paths;
+$check->(
+    'the killed install wrote some but not all new files',
+    $fresh_present > 0 && $fresh_present < $INTERRUPT_FILE_COUNT && -e journal_of($fresh_policy),
+    "$fresh_present files",
+);
+recover_target($fresh_policy);
+$check->('recovery deletes every new file', !grep { -e $_ } @$fresh_paths);
+$check->('recovery deletes the created directory', !-e $fresh_dir);
+
+# The tests check root ownership of the policy file.
+
+my $policy_file = PVE::HostArtifacts::policy_path($target);
+my $check_policy_error = sub {
+    my ($label, $pattern) = @_;
+
+    my $response = HostArtifactsTest::api_request($rpcenv, $TOKEN, 'GET', $target, {});
+    $check_match->($label, $response->{message}, $pattern);
+};
+chown(1, 1, $policy_file) or die "cannot change the owner of $policy_file: $!\n";
+$check_policy_error->('GET rejects a policy file of another owner', qr/must belong to root/);
+chown(0, 0, $policy_file) or die "cannot change the owner of $policy_file: $!\n";
+chmod(0664, $policy_file) or die "cannot change the mode of $policy_file: $!\n";
+$check_policy_error->(
+    'GET rejects a group-writable policy file',
+    qr/must not be writable by the group or other users/,
+);
+chmod(0644, $policy_file) or die "cannot change the mode of $policy_file: $!\n";
+rename($policy_file, "$policy_file.real") or die "cannot rename $policy_file: $!\n";
+symlink("$policy_file.real", $policy_file) or die "cannot link $policy_file: $!\n";
+$check_policy_error->('GET rejects a policy file that is a symbolic link', qr/symbolic link/);
+unlink($policy_file) or die "cannot delete $policy_file: $!\n";
+rename("$policy_file.real", $policy_file) or die "cannot rename $policy_file: $!\n";
+$check->('GET accepts the restored policy file', get_state($target)->{state} eq 'committed');
+
+# The tests check root ownership of destination parent directories.
+
+my $parent_dir = "$ROOT/parent/sub";
+make_path($parent_dir, { mode => 0755 });
+my $parent_file = "$parent_dir/x.conf";
+my ($parent_document, $parent_policy) = new_target('suburban/parent', file_entries([$parent_file]));
+my $parent_archive = write_artifact(
+    'parent',
+    HostArtifactsTest::artifact($parent_document, { $parent_file => { content => "x\n" } }),
+);
+chown(1, 1, $parent_dir) or die "cannot change the owner of $parent_dir: $!\n";
+$check_error->(
+    'the install rejects a parent directory of another owner',
+    sub { install_archive($parent_policy, $parent_archive) },
+    qr/parent directory \Q$parent_dir\E of .* must belong to root/,
+);
+chown(0, 0, $parent_dir) or die "cannot change the owner of $parent_dir: $!\n";
+chmod(0775, $parent_dir) or die "cannot change the mode of $parent_dir: $!\n";
+$check_error->(
+    'the install rejects a group-writable parent directory',
+    sub { install_archive($parent_policy, $parent_archive) },
+    qr/parent directory \Q$parent_dir\E of .* must not be writable/,
+);
+$check->('the rejected installs do not leave a file', !-e $parent_file);
+chmod(0755, $parent_dir) or die "cannot change the mode of $parent_dir: $!\n";
+install_archive($parent_policy, $parent_archive);
+$check->('the install succeeds with a root-owned parent directory', -e $parent_file);
+
+# The tests check a policy directory of another owner.
+
+my $owned_dir = "$ROOT/owned";
+my $owned_file = "$owned_dir/a.conf";
+my ($owned_document, $owned_policy) = new_target(
+    'suburban/owned',
+    file_entries([$owned_file]),
+    [{ path => $owned_dir, mode => '0755', owner => 'daemon', group => 'daemon' }],
+);
+my $owned_archive = write_artifact(
+    'owned',
+    HostArtifactsTest::artifact($owned_document, { $owned_file => { content => "a\n" } }),
+);
+install_archive($owned_policy, $owned_archive);
+my @owned_stat = lstat($owned_dir);
+$check->(
+    'the install creates the directory with the policy owner',
+    $owned_stat[4] == scalar(getpwnam('daemon')) && $owned_stat[5] == scalar(getgrnam('daemon')),
+);
+my $owned_before = snapshot($owned_file);
+eval { install_archive($owned_policy, $owned_archive) };
+$check->('a repeat install with a directory of another owner succeeds', !$@, $@);
+$check->('the repeat install leaves the file unchanged', snapshot($owned_file) eq $owned_before);
+$check->(
+    'GET reports the file under the directory of another owner as matching',
+    files_by_path(get_state($owned_policy->{target}))->{$owned_file}->{matches},
+);
+
+# The tests check stage size limits.
+
+my $limited_document = HostArtifactsTest::base_policy('suburban/limits', []);
+$limited_document->{configuration}->{max_archive_bytes} = 100;
+$limited_document->{configuration}->{max_bundle_bytes} = 50;
+my $limited_target = HostArtifactsTest::write_policy($limited_document);
+my $stage_chunk = sub {
+    my ($kind, $offset, $bytes, $stage) = @_;
+
+    my $params = { kind => $kind, offset => $offset, data => encode_base64($bytes, '') };
+    $params->{stage} = $stage if defined($stage);
+    return HostArtifactsTest::api_request(
+        $rpcenv, $TOKEN, 'POST', "$limited_target/stage", $params,
+    );
+};
+$check->(
+    'an archive stage at the limit succeeds',
+    $stage_chunk->('archive', 0, 'a' x 100)->{status} == 200,
+);
+$check_match->(
+    'an archive chunk above the limit fails',
+    $stage_chunk->('archive', 0, 'a' x 101)->{message},
+    qr/archive is larger than 100 bytes/,
+);
+my $partial = $stage_chunk->('archive', 0, 'a' x 60)->{data}->{stage};
+$check_match->(
+    'a later chunk that passes the archive limit fails',
+    $stage_chunk->('archive', 60, 'a' x 41, $partial)->{message},
+    qr/archive is larger than 100 bytes/,
+);
+$check->(
+    'a bundle stage at the limit succeeds',
+    $stage_chunk->('bundle', 0, 'b' x 50)->{status} == 200,
+);
+$check_match->(
+    'a bundle chunk above the limit fails',
+    $stage_chunk->('bundle', 0, 'b' x 51)->{message},
+    qr/bundle is larger than 50 bytes/,
+);
+
+# The tests check installs of one target under the target lock.
+
+my $lock_dir = "$ROOT/lock";
+make_path($lock_dir, { mode => 0755 });
+my $lock_paths = [map { "$lock_dir/file-$_.conf" } 1 .. 50];
+my ($lock_document, $lock_policy) = new_target('suburban/lock', file_entries($lock_paths));
+my $lock_one = write_artifact(
+    'lock-one', HostArtifactsTest::artifact($lock_document, contents($lock_paths, 'one')),
+);
+my $lock_two = write_artifact(
+    'lock-two', HostArtifactsTest::artifact($lock_document, contents($lock_paths, 'two')),
+);
+
+# The function takes the target lock in a child process for $seconds and returns the process ID
+# after the child has the lock.
+sub hold_lock {
+    my ($policy, $seconds) = @_;
+
+    pipe(my $reader, my $writer) or die "cannot create a pipe: $!\n";
+    my $pid = fork() // die "cannot fork: $!\n";
+    if (!$pid) {
+        close($reader);
+        PVE::HostArtifacts::with_target_lock(
+            $policy->{target},
+            sub {
+                print {$writer} "locked\n";
+                close($writer);
+                Time::HiRes::sleep($seconds);
+            },
+        );
+        POSIX::_exit(0);
+    }
+    close($writer);
+    my $line = <$reader>;
+    close($reader);
+    die "the lock holder did not take the lock\n" if ($line // '') ne "locked\n";
+    return $pid;
+}
+
+my $short_holder = hold_lock($lock_policy, 3);
+my $wait_start = Time::HiRes::time();
+install_archive($lock_policy, $lock_one);
+my $waited = Time::HiRes::time() - $wait_start;
+waitpid($short_holder, 0);
+$check->('an install waits for the target lock', $waited >= 2.5, "waited $waited seconds");
+
+my $long_holder = hold_lock($lock_policy, 30);
+my $lock_before = snapshot(@$lock_paths);
+$check_error->(
+    'an install fails when the target lock stays taken',
+    sub { install_archive($lock_policy, $lock_two) },
+    qr/can't lock file/,
+);
+$check->('the failed install leaves the files unchanged', snapshot(@$lock_paths) eq $lock_before);
+kill('KILL', $long_holder);
+waitpid($long_holder, 0);
+
+my @installers;
+for my $archive ($lock_two, $lock_one) {
+    my $pid = fork() // die "cannot fork: $!\n";
+    if (!$pid) {
+        open(STDOUT, '>', '/dev/null') or POSIX::_exit(2);
+        eval { install_archive($lock_policy, $archive) };
+        POSIX::_exit($@ ? 1 : 0);
+    }
+    push @installers, $pid;
+}
+my @exit_codes;
+for my $pid (@installers) {
+    waitpid($pid, 0);
+    push @exit_codes, $? >> 8;
+}
+$check->('two concurrent installs of one target both succeed', "@exit_codes" eq '0 0');
+my $one_count = count_with_prefix($lock_paths, 'one');
+my $two_count = count_with_prefix($lock_paths, 'two');
+$check->(
+    'the files equal one complete archive after concurrent installs',
+    ($one_count == 50 && $two_count == 0) || ($one_count == 0 && $two_count == 50),
+    "one=$one_count two=$two_count",
+);
+my $lock_state = get_state($lock_policy->{target});
+$check->(
+    'GET reports every file as matching after concurrent installs',
+    $lock_state->{state} eq 'committed' && !grep { !$_->{matches} } @{ $lock_state->{files} },
+);
+
+# The tests check two targets that list the same directory.
+
+my $shared_dir = "$ROOT/shared";
+make_path($shared_dir, { mode => 0700 });
+chmod(0700, $shared_dir) or die "cannot change the mode of $shared_dir: $!\n";
+my $shared_b_paths = numbered_paths($shared_dir, 'b');
+my $shared_a_file = "$shared_dir/a.conf";
+my ($shared_b_document, $shared_b_policy) = new_target(
+    'suburban/shared-b',
+    file_entries($shared_b_paths),
+    [{ path => $shared_dir, mode => '0755', owner => 'root', group => 'root' }],
+);
+my $shared_b_archive = write_artifact(
+    'shared-b', HostArtifactsTest::artifact($shared_b_document, contents($shared_b_paths, 'b')),
+);
+my $shared_a_files = { $shared_a_file => { content => "a\n" } };
+my ($shared_a_document, $shared_a_policy) = new_target(
+    'suburban/shared-a',
+    file_entries([$shared_a_file]),
+    [{ path => $shared_dir, mode => '0750', owner => 'root', group => 'root' }],
+);
+my $shared_a_archive =
+    write_artifact('shared-a', HostArtifactsTest::artifact($shared_a_document, $shared_a_files));
+
+stop_install($shared_b_policy, $shared_b_archive, 'KILL', sub { -e $shared_b_paths->[0] });
+$check->(
+    'the install of target B stops with its directory mode',
+    -e journal_of($shared_b_policy) && directory_mode($shared_dir) eq '0755',
+);
+install_archive($shared_a_policy, $shared_a_archive);
+$check->('target A sets its directory mode', directory_mode($shared_dir) eq '0750');
+recover_target($shared_b_policy);
+$check->(
+    'the rollback of target B keeps the directory mode that target A set',
+    directory_mode($shared_dir) eq '0750',
+);
+$check->('the rollback of target B deletes its new files', !grep { -e $_ } @$shared_b_paths);
+$check->('the rollback of target B keeps the file of target A', -e $shared_a_file);
+
+$shared_a_document->{directories}->[0]->{mode} = '0755';
+HostArtifactsTest::write_policy($shared_a_document);
+$shared_a_policy = PVE::HostArtifacts::load_policy($shared_a_policy->{target});
+my $shared_a_same = write_artifact(
+    'shared-a-same', HostArtifactsTest::artifact($shared_a_document, $shared_a_files),
+);
+chmod(0700, $shared_dir) or die "cannot change the mode of $shared_dir: $!\n";
+stop_install($shared_b_policy, $shared_b_archive, 'KILL', sub { -e $shared_b_paths->[0] });
+install_archive($shared_a_policy, $shared_a_same);
+recover_target($shared_b_policy);
+$check->(
+    'the rollback of target B restores the mode that target B changed and target A also lists',
+    directory_mode($shared_dir) eq '0700',
+);
+install_archive($shared_a_policy, $shared_a_same);
+$check->(
+    'the next install of target A sets its directory mode again',
+    directory_mode($shared_dir) eq '0755',
 );
 
 remove_tree($ROOT, $WORK);
