@@ -1359,25 +1359,23 @@ my $listed_archive = write_artifact(
     'shared-listed',
     HostArtifactsTest::artifact($listed_document, { $shared_a_file => { content => "a two\n" } }),
 );
-my $listed_installed = "$STATE_DIR/$shared_a_policy->{target}/installed.json";
-my $listed_before = $json->encode({
-    parent => [(lstat($shared_dir))[1, 2, 4, 5, 10]],
-    file => snapshot($shared_a_file),
-    installed => HostArtifactsTest::read_file($listed_installed),
-});
+my $listed_state = sub {
+    return $json->encode({
+        parent => [(lstat($shared_dir))[1, 2, 4, 5, 10]],
+        file => snapshot($shared_a_file),
+        target => HostArtifactsTest::target_state($shared_a_policy->{target}, $shared_a_file),
+    });
+};
+my $listed_before = $listed_state->();
 $check_error->(
     'the install rejects a manifest directory that the policy lists as inspect-only',
     sub { install_archive($shared_a_policy, $listed_archive) },
     qr/manifest lists the directory \Q$shared_dir\E, and the policy lists it only as an/,
 );
 $check->(
-    'the rejection leaves the parent, the file, and the installed record unchanged',
-    $json->encode({
-        parent => [(lstat($shared_dir))[1, 2, 4, 5, 10]],
-        file => snapshot($shared_a_file),
-        installed => HostArtifactsTest::read_file($listed_installed),
-    }) eq $listed_before
-        && !-e journal_of($shared_a_policy),
+    'the rejection does not change the parent, the file, the installed record, the journal,'
+        . ' or the lock file',
+    $listed_state->() eq $listed_before && !-e journal_of($shared_a_policy),
 );
 $check_unrelated->('the rejected manifest directory');
 
