@@ -225,7 +225,6 @@ sub api_request {
     );
 }
 
-# The function stages a file in chunks with the stage method and returns the stage identifier.
 sub stage_file {
     my ($rpcenv, $user, $target, $kind, $content) = @_;
 

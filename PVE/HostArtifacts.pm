@@ -97,7 +97,6 @@ my $INSTALLED_KEYS =
 
 my $json = JSON->new->utf8->canonical;
 
-# The function checks the value against the pattern and returns it without the taint flag.
 my $untaint = sub {
     my ($value, $pattern, $label) = @_;
 
@@ -221,8 +220,7 @@ my $check_entries = sub {
     return $entries;
 };
 
-# The function validates the inspect-only parent directories of a policy. An entry has a path.
-# The entry must list all three of mode, owner, and group or must not list any of them.
+# A parent entry must list all three of mode, owner, and group or must not list any of them.
 my $check_parent_entries = sub {
     my ($list, $label) = @_;
 
