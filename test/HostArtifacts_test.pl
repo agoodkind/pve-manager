@@ -488,41 +488,62 @@ $check->(
     'GET reports the owned directory as matching',
     $directory_entry->($state)->{matches} && $directory_entry->($state)->{mode} eq '0750',
 );
-chmod(0755, $owned_new) or die "cannot change the mode of $owned_new: $!\n";
-my $files_before_directory_drift = snapshot(@all_paths);
-$state = get_state($target);
-$check->(
-    'GET reports that an owned directory with another mode does not match',
-    !$directory_entry->($state)->{matches} && $directory_entry->($state)->{mode} eq '0755',
-);
-$check->(
-    'the observed digest changes with directory drift',
-    $state->{observed_sha256} ne $clean_digest,
-);
-$check->('GET leaves the owned directory unchanged', directory_mode($owned_new) eq '0755');
-my $directory_repair_upid = install_archive($policy, $archive_one);
-$state = get_state($target);
-$check->(
-    'a repeat install restores the owned directory mode',
-    directory_mode($owned_new) eq '0750',
-);
-$check->(
-    'GET reports the repaired owned directory as matching',
-    $directory_entry->($state)->{matches},
-);
-$check->(
-    'the observed digest returns to its clean value after the directory repair',
-    $state->{observed_sha256} eq $clean_digest,
-);
-$check->(
-    'the directory repair leaves every file unchanged',
-    snapshot(@all_paths) eq $files_before_directory_drift,
-);
-$check->(
-    'the directory repair keeps every file write_id',
-    !grep { $_->{write_id} eq $directory_repair_upid } @{ $state->{files} },
-);
-$check_unrelated->('the directory drift and repair');
+my $directory_metadata = sub {
+    return $json->encode([(lstat($owned_new))[1, 2, 4, 5]]);
+};
+my $write_ids = sub {
+    my ($current) = @_;
+
+    return $json->encode({ map { $_->{path} => $_->{write_id} } @{ $current->{files} } });
+};
+my $clean_directory = $directory_metadata->();
+my $clean_write_ids = $write_ids->($state);
+my $daemon_uid = getpwnam('daemon');
+for my $drift (
+    ['mode', sub { chmod(0755, $owned_new) }, 'mode', '0755'],
+    ['owner', sub { chown($daemon_uid, -1, $owned_new) }, 'uid', $daemon_uid],
+) {
+    my ($kind, $change, $field, $value) = @$drift;
+    $change->() or die "cannot change the $kind of $owned_new: $!\n";
+    my $files_before_drift = snapshot(@all_paths);
+    my $drifted_directory = $directory_metadata->();
+    $state = get_state($target);
+    $check->(
+        "GET reports that an owned directory with another $kind does not match",
+        !$directory_entry->($state)->{matches} && $directory_entry->($state)->{$field} eq $value,
+    );
+    $check->(
+        "observed_sha256 changes when the owned directory $kind changes",
+        $state->{observed_sha256} ne $clean_digest,
+    );
+    $check->(
+        "GET does not change the owned directory with another $kind",
+        $directory_metadata->() eq $drifted_directory,
+    );
+    install_archive($policy, $archive_one);
+    $state = get_state($target);
+    $check->(
+        "a repeat install restores the owned directory $kind",
+        $directory_metadata->() eq $clean_directory,
+    );
+    $check->(
+        "GET reports the owned directory as matching after the $kind repair",
+        $directory_entry->($state)->{matches},
+    );
+    $check->(
+        "observed_sha256 equals its earlier clean value after the $kind repair",
+        $state->{observed_sha256} eq $clean_digest,
+    );
+    $check->(
+        "The $kind repair does not change any file",
+        snapshot(@all_paths) eq $files_before_drift,
+    );
+    $check->(
+        "Every file keeps its write_id after the $kind repair",
+        $write_ids->($state) eq $clean_write_ids,
+    );
+    $check_unrelated->("the directory $kind drift and repair");
+}
 
 # Identity and member rejections. Every rejection leaves the files unchanged.
 
