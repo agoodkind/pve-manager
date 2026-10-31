@@ -61,6 +61,22 @@ test-custom-cpu-models:
 test-pvesh:
 	./pvesh_test.pl
 
+# These targets write below /etc and /var/lib and run as root in a disposable container with
+# the overlay access control patch applied. The attestation target also needs the installed
+# /usr/bin/gh and HOST_ARTIFACT_FIXTURE_DIR.
+.PHONY: test-host-artifacts
+test-host-artifacts:
+	./HostArtifacts_test.pl
+
+# This target also needs systemd as process 1.
+.PHONY: test-host-secrets
+test-host-secrets:
+	./HostSecrets_test.pl
+
+.PHONY: test-host-artifacts-attestation
+test-host-artifacts-attestation:
+	./HostArtifacts_attestation_test.pl
+
 .PHONY: install
 install:
 
