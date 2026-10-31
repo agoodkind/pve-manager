@@ -201,7 +201,11 @@ $document->{secret_fields} = [$secret_descriptor];
 my $target = HostArtifactsTest::write_policy($document);
 my $policy = PVE::HostArtifacts::load_policy($target);
 
-my $other_document = HostArtifactsTest::base_policy('suburban/secret-other', []);
+my $other_artifact_file = "$ROOT/other/app.conf";
+my $other_document = HostArtifactsTest::base_policy(
+    'suburban/secret-other',
+    [{ path => $other_artifact_file, mode => '0644', owner => 'root', group => 'root' }],
+);
 $other_document->{secret_fields} = [{
     %$secret_descriptor,
     name => $OTHER_FIELD,
@@ -220,20 +224,31 @@ run_systemctl('daemon-reload');
 system({$SYSTEMCTL} $SYSTEMCTL, 'reset-failed', $CONSUMER, $OTHER_CONSUMER, $UNRELATED);
 run_systemctl('restart', $CONSUMER, $OTHER_CONSUMER, $UNRELATED);
 
-my $archive = "$ROOT/app.tar.gz";
-my ($manifest, $members) =
-    HostArtifactsTest::artifact($document, { $artifact_file => { content => "app\n" } });
-HostArtifactsTest::write_archive(
-    $archive, [{ name => 'manifest.json', content => $json->encode($manifest) }, @$members],
-);
-PVE::HostArtifacts::with_target_lock(
-    $target,
-    sub {
-        PVE::HostArtifacts::install_verified_archive(
-            $policy, HostArtifactsTest::request($archive), $archive, 'UPID:test:artifact',
-            'deploy@pve!install',
-        );
-    },
+# The function installs one file for a target using the module entry point.
+sub install_file {
+    my ($install_document, $install_policy, $path, $name) = @_;
+
+    my $archive = "$ROOT/$name.tar.gz";
+    my ($manifest, $members) =
+        HostArtifactsTest::artifact($install_document, { $path => { content => "$name\n" } });
+    HostArtifactsTest::write_archive(
+        $archive, [{ name => 'manifest.json', content => $json->encode($manifest) }, @$members],
+    );
+    PVE::HostArtifacts::with_target_lock(
+        $install_policy->{target},
+        sub {
+            PVE::HostArtifacts::install_verified_archive(
+                $install_policy, HostArtifactsTest::request($archive), $archive,
+                "UPID:test:$name", 'deploy@pve!install',
+            );
+        },
+    );
+}
+
+install_file($document, $policy, $artifact_file, 'app');
+install_file(
+    $other_document, PVE::HostArtifacts::load_policy($other_target), $other_artifact_file,
+    'other-app',
 );
 my $other_status = set_secret($other_target, $OTHER_FIELD, value('other'), 1);
 $check->('the unrelated target sets its field', $other_status eq 'OK', $other_status);
@@ -244,8 +259,9 @@ sub unrelated_state {
     return $json->encode({
         artifact => file_state($artifact_file),
         installed => read_or_absent("$STATE_DIR/$target/installed.json"),
-        other_secret => file_state($other_secret_file),
-        other_record => read_or_absent("$STATE_DIR/$other_target/secrets.json"),
+        other_target => HostArtifactsTest::target_state(
+            $other_target, $other_artifact_file, $other_secret_file,
+        ),
         other_consumer => unit_property($OTHER_CONSUMER, 'InvocationID'),
         unrelated => unit_property($UNRELATED, 'InvocationID'),
     });
@@ -255,7 +271,8 @@ my $check_unrelated = sub {
     my ($label) = @_;
 
     $check->(
-        "$label leaves the unrelated files, records, and units unchanged",
+        "the unrelated files, records, journal, lock file, and units remain unchanged"
+            . " after the test of $label",
         unrelated_state() eq $unrelated_before,
     );
 };

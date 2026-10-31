@@ -267,6 +267,32 @@ sub check {
     print "OK: $label\n";
 }
 
+# The function returns the content and metadata of the listed files and of the installed record,
+# secret record, journal, and lock file of one target. A test compares the result before and
+# after a request for another target.
+sub target_state {
+    my ($target, @paths) = @_;
+
+    my $state_dir = "/var/lib/pve-overlay/host-artifacts/$target";
+    my $state = {};
+    for my $path (
+        @paths,
+        "$state_dir/installed.json",
+        "$state_dir/secrets.json",
+        "$state_dir/journal.json",
+        "/run/lock/pve-overlay-host-artifact-$target.lck",
+    ) {
+        my @stat = lstat($path);
+        if (!@stat) {
+            $state->{$path} = 'absent';
+            next;
+        }
+        my $digest = -f _ ? Digest::SHA->new(256)->addfile($path)->hexdigest() : '';
+        $state->{$path} = join(':', $digest, @stat[1, 2, 4, 5, 7, 9]);
+    }
+    return $json->encode($state);
+}
+
 sub check_match {
     my ($label, $value, $pattern) = @_;
 

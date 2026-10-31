@@ -442,6 +442,39 @@ $check->(
     $state->{observed_sha256} eq $clean_digest,
 );
 
+# The tests install an unrelated target and compare its files, installed record, journal, and
+# lock file after directory repair, install recovery, target B recovery, manifest rejection,
+# and owned directory recovery.
+
+my $unrelated_dir = "$ROOT/unrelated";
+my $unrelated_file = "$unrelated_dir/u.conf";
+my $unrelated_document = HostArtifactsTest::base_policy(
+    'suburban/observation-unrelated',
+    [{ path => $unrelated_file, mode => '0644', owner => 'root', group => 'root' }],
+    [{ path => $unrelated_dir, mode => '0750', owner => 'root', group => 'root' }],
+);
+my $unrelated_target = HostArtifactsTest::write_policy($unrelated_document);
+my $unrelated_policy = PVE::HostArtifacts::load_policy($unrelated_target);
+install_archive(
+    $unrelated_policy,
+    write_artifact(
+        'unrelated',
+        HostArtifactsTest::artifact($unrelated_document, { $unrelated_file => { content => "u\n" } }),
+    ),
+);
+my $unrelated_before =
+    HostArtifactsTest::target_state($unrelated_target, $unrelated_dir, $unrelated_file);
+my $check_unrelated = sub {
+    my ($label) = @_;
+
+    $check->(
+        "the unrelated target's files, record, journal, and lock file remain unchanged"
+            . " after the test of $label",
+        HostArtifactsTest::target_state($unrelated_target, $unrelated_dir, $unrelated_file) eq
+            $unrelated_before,
+    );
+};
+
 # The tests check drift of an owned directory.
 
 my $owned_new = "$ROOT/etc/new";
@@ -489,6 +522,7 @@ $check->(
     'the directory repair keeps every file write_id',
     !grep { $_->{write_id} eq $directory_repair_upid } @{ $state->{files} },
 );
+$check_unrelated->('the directory drift and repair');
 
 # Identity and member rejections. Every rejection leaves the files unchanged.
 
@@ -865,6 +899,7 @@ $check->(
 );
 my @many_leftovers = list_leftovers("$ROOT/many");
 $check->('recovery leaves no temporary or backup file', !@many_leftovers, "@many_leftovers");
+$check_unrelated->('the interrupted install and its recovery');
 
 # Stage expiry deletes an old stage and keeps an old stage that the journal lists.
 
@@ -1274,24 +1309,35 @@ $check->(
     $shared_a_state->{state} eq 'committed'
         && !grep { !$_->{matches} } @{ $shared_a_state->{files} },
 );
+$check_unrelated->('the recovery of target B');
 
-# The install does not change an inspect-only parent that the manifest lists as a directory.
+# The install rejects a manifest directory that the policy lists only as an inspect-only parent.
 my $listed_document = { %$shared_a_document, directories => $shared_parent };
-my $listed_archive =
-    write_artifact('shared-listed', HostArtifactsTest::artifact($listed_document, $shared_a_files));
-my $listed_before = $json->encode([(lstat($shared_dir))[1, 2, 4, 5, 10]]);
-install_archive($shared_a_policy, $listed_archive);
+my $listed_archive = write_artifact(
+    'shared-listed',
+    HostArtifactsTest::artifact($listed_document, { $shared_a_file => { content => "a two\n" } }),
+);
+my $listed_installed = "$STATE_DIR/$shared_a_policy->{target}/installed.json";
+my $listed_before = $json->encode({
+    parent => [(lstat($shared_dir))[1, 2, 4, 5, 10]],
+    file => snapshot($shared_a_file),
+    installed => HostArtifactsTest::read_file($listed_installed),
+});
+$check_error->(
+    'the install rejects a manifest directory that the policy lists as inspect-only',
+    sub { install_archive($shared_a_policy, $listed_archive) },
+    qr/manifest lists the directory \Q$shared_dir\E, and the policy lists it only as an/,
+);
 $check->(
-    'a manifest directory that the policy lists as inspect-only stays unchanged',
-    $json->encode([(lstat($shared_dir))[1, 2, 4, 5, 10]]) eq $listed_before,
+    'the rejection leaves the parent, the file, and the installed record unchanged',
+    $json->encode({
+        parent => [(lstat($shared_dir))[1, 2, 4, 5, 10]],
+        file => snapshot($shared_a_file),
+        installed => HostArtifactsTest::read_file($listed_installed),
+    }) eq $listed_before
+        && !-e journal_of($shared_a_policy),
 );
-my $listed_record = $json->decode(
-    HostArtifactsTest::read_file("$STATE_DIR/$shared_a_policy->{target}/installed.json"),
-);
-$check->(
-    'the installed record does not list the inspect-only directory',
-    !@{ $listed_record->{directories} },
-);
+$check_unrelated->('the rejected manifest directory');
 
 # The policy lists an inspect-only parent without mode, owner, and group.
 my $plain_dir = "$ROOT/plain";
@@ -1336,6 +1382,7 @@ $check->(
     'the recovery restores the mode of the owned directory',
     directory_mode($owned_c_dir) eq '0700',
 );
+$check_unrelated->('the owned directory recovery');
 
 # A policy cannot list one path as an owned directory and as an inspect-only parent.
 my $overlap_document = HostArtifactsTest::base_policy(

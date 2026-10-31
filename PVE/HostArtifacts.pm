@@ -1014,13 +1014,12 @@ sub validate_archive {
 
     my $listed = $check_entries->($manifest->{directories}, "$label directories");
     my $directories = {};
-    my $inspected = {};
     for my $path (sort keys %$listed) {
-        # A manifest directory that the policy lists as an inspect-only parent stays as it is.
-        if ($policy->{parents}->{$path}) {
-            $inspected->{$path} = 1;
-            next;
-        }
+        # A manifest directory sets directory metadata. The target may set it only for a
+        # directory that it owns.
+        die "the manifest lists the directory $path, and the policy lists it only as an"
+            . " inspect-only parent\n"
+            if $policy->{parents}->{$path};
         $directories->{$path} = $listed->{$path};
         my $allowed = $policy->{directories}->{$path};
         die "the policy does not list the directory $path\n" if !$allowed;
@@ -1076,7 +1075,6 @@ sub validate_archive {
     return {
         manifest_sha256 => Digest::SHA::sha256_hex($manifest_content),
         directories => $directories,
-        inspected => $inspected,
         files => $files,
     };
 }
@@ -1362,13 +1360,9 @@ my $journal_copy = sub {
 };
 
 # The function plans changes only for the directories that the policy lets this target own.
-# It checks each inspect-only parent that the manifest lists and does not plan a change for it.
 my $plan_directories = sub {
     my ($policy, $validated) = @_;
 
-    for my $path (sort keys %{ $validated->{inspected} }) {
-        $check_parent_directory->($policy->{parents}->{$path});
-    }
     my $directories = [];
     my $declared = { map { $_ => 1 } keys %{ $validated->{directories} } };
     for my $path (sort keys %{ $validated->{directories} }) {
