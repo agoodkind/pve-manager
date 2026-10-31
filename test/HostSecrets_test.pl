@@ -410,6 +410,49 @@ $check->(
 );
 $check_unrelated->('the drift repair');
 
+# The tests check drift of the storage file mode and owner.
+
+for my $drift (
+    ['mode', sub { chmod(0644, $secret_file) or die "cannot change $secret_file: $!\n" }],
+    ['owner', sub { chown(1, 1, $secret_file) or die "cannot change $secret_file: $!\n" }],
+) {
+    my ($kind, $change) = @$drift;
+    $change->();
+    my $drifted = file_state($secret_file);
+    my $drift_state = secret_state($target, $FIELD);
+    $check->(
+        "GET reports that a storage file with another $kind does not match the policy",
+        !$drift_state->{configured},
+    );
+    $check->(
+        "GET reports the content SHA-256 of a storage file with another $kind",
+        $drift_state->{sha256} eq content_sha($FIELD, value('two')),
+    );
+    $check->(
+        "GET leaves the storage file with another $kind unchanged",
+        file_state($secret_file) eq $drifted,
+    );
+    $consumer_before = unit_property($CONSUMER, 'InvocationID');
+    my $inode_before = (lstat($secret_file))[1];
+    $status = set_secret($target, $FIELD, value('two'), 2);
+    $check->("a retry of version 2 repairs the $kind", $status eq 'OK', $status);
+    my @repaired = lstat($secret_file);
+    $check->(
+        "the repair restores mode 0600 and owner root",
+        ($repaired[2] & 07777) == 0600 && $repaired[4] == 0 && $repaired[5] == 0,
+    );
+    $check->("the $kind repair keeps the inode of the storage file", $repaired[1] == $inode_before);
+    $check->(
+        "the $kind repair does not restart the consumer",
+        unit_property($CONSUMER, 'InvocationID') eq $consumer_before,
+    );
+    $check->(
+        'GET reports the repaired storage file as configured',
+        secret_state($target, $FIELD)->{configured},
+    );
+    $check_unrelated->("the $kind repair");
+}
+
 # The tests check a failed consumer restart and its retry.
 
 HostArtifactsTest::write_file("$ROOT/state/fail", '');
@@ -428,9 +471,14 @@ $check->(
     join(',', @{ secret_record($target, $FIELD)->{pending} }) eq $CONSUMER,
 );
 unlink("$ROOT/state/fail") or die "cannot delete $ROOT/state/fail: $!\n";
+chmod(0644, $secret_file) or die "cannot change $secret_file: $!\n";
 $consumer_before = unit_property($CONSUMER, 'InvocationID');
 $status = set_secret($target, $FIELD, value('three'), 3);
 $check->('a retry of version 3 succeeds', $status eq 'OK', $status);
+$check->(
+    'the retry restores the mode and keeps the recorded restart',
+    ((lstat($secret_file))[2] & 07777) == 0600,
+);
 $check->(
     'the retry restarts the consumer',
     unit_property($CONSUMER, 'InvocationID') ne $consumer_before

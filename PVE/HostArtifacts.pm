@@ -1095,6 +1095,7 @@ sub observe_file {
         path => $path,
         present => 1,
         regular => S_ISREG($stat[2]) ? 1 : 0,
+        directory => S_ISDIR($stat[2]) ? 1 : 0,
         size => $stat[7],
         mode => sprintf('%04o', S_IMODE($stat[2])),
         uid => $stat[4],
@@ -1109,16 +1110,38 @@ sub observe_file {
     return $observation;
 }
 
-my $observation_matches = sub {
+my $content_matches = sub {
     my ($observation, $expected) = @_;
 
     return 0 if !$observation->{present} || !$observation->{regular};
     return 0 if $observation->{sha256} ne $expected->{sha256};
     return 0 if $observation->{size} != $expected->{size};
-    return 0 if $observation->{mode} ne $expected->{mode};
-    return 0 if $observation->{uid} != $expected->{uid};
-    return 0 if $observation->{gid} != $expected->{gid};
     return 1;
+};
+
+my $metadata_matches = sub {
+    my ($observation, $expected) = @_;
+
+    return 0 if !$observation->{present};
+    return 0 if $observation->{mode} ne $expected->{mode};
+    return 0 if !defined($expected->{uid}) || $observation->{uid} != $expected->{uid};
+    return 0 if !defined($expected->{gid}) || $observation->{gid} != $expected->{gid};
+    return 1;
+};
+
+my $observation_matches = sub {
+    my ($observation, $expected) = @_;
+
+    return $content_matches->($observation, $expected)
+        && $metadata_matches->($observation, $expected) ? 1 : 0;
+};
+
+my $directory_matches = sub {
+    my ($observation, $expected) = @_;
+
+    return $observation->{present}
+        && $observation->{directory}
+        && $metadata_matches->($observation, $expected) ? 1 : 0;
 };
 
 # The function checks an inspect-only parent directory and never changes it. The directory
@@ -1683,7 +1706,17 @@ my $secret_states = sub {
     for my $name (sort keys %{ $policy->{secret_fields} }) {
         my $descriptor = $policy->{secret_fields}->{$name};
         my $observation = observe_file($descriptor->{path});
-        my $state = { field => $name, configured => $observation->{present} };
+        # configured is true when the storage file is a regular file with the mode, owner, and
+        # group of the policy. The SHA-256 represents the content of a regular storage file.
+        my $expected = {
+            mode => $descriptor->{mode},
+            uid => scalar(getpwnam($descriptor->{owner})),
+            gid => scalar(getgrnam($descriptor->{group})),
+        };
+        my $configured = $observation->{present}
+            && $observation->{regular}
+            && $metadata_matches->($observation, $expected) ? 1 : 0;
+        my $state = { field => $name, configured => $configured };
         $state->{sha256} = $observation->{sha256} if defined($observation->{sha256});
         my $record = $secrets->{fields}->{$name};
         $state->{version} = $record->{version} if $record;
@@ -1779,12 +1812,28 @@ my $write_secret_file = sub {
     $sync_dir->(dirname($path));
 };
 
+# The function sets the mode, owner, and group of the policy on the existing storage file and
+# does not change its content.
+my $repair_secret_metadata = sub {
+    my ($descriptor, $uid, $gid) = @_;
+
+    my $path = $descriptor->{path};
+    sysopen(my $handle, $path, O_RDONLY | O_NOFOLLOW) or die "cannot open $path: $!\n";
+    my @stat = stat($handle);
+    die "$path does not identify a regular file\n" if !S_ISREG($stat[2]);
+    chown($uid, $gid, $handle) or die "cannot change the owner of $path: $!\n";
+    chmod(oct($descriptor->{mode}), $handle) or die "cannot change the mode of $path: $!\n";
+    $handle->sync() or die "cannot sync $path: $!\n";
+    close($handle) or die "cannot close $path: $!\n";
+};
+
 # The function sets one secret field in a task worker. A lower version fails. The same version
 # with another value fails. When the version and value match the record, the storage file
 # matches, and the record does not list a consumer restart, the task does not change anything.
-# Otherwise, the task records the version first and writes the storage file when its bytes,
-# mode, owner, or group differ. Before writing, the task records a restart for each consumer
-# unit that is running. The task then restarts each recorded unit that is running or failed.
+# Otherwise, the task records the version first. When the content differs, the task records a
+# restart for each consumer unit that is running and writes the storage file. When only the
+# mode, owner, or group differs, the task changes them on the existing file and does not record
+# a restart. The task then restarts each recorded unit that is running or failed.
 # It removes a recorded unit that is inactive, deactivating, or in maintenance from the record
 # without starting it. The record retains a failed restart. The next accepted request for the
 # field checks the state of the unit.
@@ -1826,16 +1875,15 @@ sub set_secret {
             my $observation = observe_file($path);
             die "$path exists and is not a regular file\n"
                 if $observation->{present} && !$observation->{regular};
-            my $file_matches = $observation_matches->(
-                $observation,
-                {
-                    sha256 => $sha256,
-                    size => length($content),
-                    mode => $descriptor->{mode},
-                    uid => $uid,
-                    gid => $gid,
-                },
-            );
+            my $expected = {
+                sha256 => $sha256,
+                size => length($content),
+                mode => $descriptor->{mode},
+                uid => $uid,
+                gid => $gid,
+            };
+            my $same_content = $content_matches->($observation, $expected);
+            my $same_metadata = $same_content && $metadata_matches->($observation, $expected);
 
             # A recorded restart counts only for a unit that the policy still lists.
             my $declared = { map { $_ => 1 } @{ $descriptor->{consumer_units} } };
@@ -1844,7 +1892,9 @@ sub set_secret {
                 my $checked = $untaint->($unit, $UNIT_RE, 'recorded consumer unit');
                 $pending->{$checked} = 1 if $declared->{$checked};
             }
-            if (!$file_matches) {
+            # The task records new restarts only when the content changes. A metadata repair
+            # keeps the restarts that an earlier failed or stopped task recorded.
+            if (!$same_content) {
                 for my $unit (@{ $descriptor->{consumer_units} }) {
                     if ($RUNNING_STATES->{ $unit_state->($unit) }) {
                         $pending->{$unit} = 1;
@@ -1860,25 +1910,28 @@ sub set_secret {
                 pending => [sort keys %$pending],
             };
 
-            if ($file_matches && !%$pending && $record && $record->{version} == $version) {
+            if ($same_metadata && !%$pending && $record && $record->{version} == $version) {
                 print "the secret field $name already has version $version, and the task did"
                     . " not change a file or a unit\n";
                 return;
             }
 
-            if (!$file_matches) {
+            if (!$same_metadata) {
                 $check_ancestors->($path, $policy->{directories}, $policy->{parents});
                 die "the parent directory of $path does not exist\n" if !-d dirname($path);
-                $next->{temporary} = $sibling_name->($path, 'new');
             }
+            $next->{temporary} = $sibling_name->($path, 'new') if !$same_content;
             $secrets->{fields}->{$name} = $next;
             $write_secrets->($policy->{target}, $secrets);
 
-            if (!$file_matches) {
+            if (!$same_content) {
                 $write_secret_file->($descriptor, $content, $next->{temporary});
                 delete $next->{temporary};
                 $write_secrets->($policy->{target}, $secrets);
                 print "the task wrote version $version of the secret field $name to $path\n";
+            } elsif (!$same_metadata) {
+                $repair_secret_metadata->($descriptor, $uid, $gid);
+                print "the task restored the mode, owner, and group of $path\n";
             }
 
             for my $unit (sort keys %$pending) {
@@ -1897,8 +1950,8 @@ sub set_secret {
 }
 
 # The function returns the policy identity, the installed record, and the live state of each
-# installed file. Without an installed record, the files are the policy destinations. The
-# function does not change a file.
+# installed file and owned directory. Without an installed record, the files and directories
+# are those of the policy. The function does not change a file.
 sub read_state {
     my ($target) = @_;
 
@@ -1930,6 +1983,24 @@ sub read_state {
         $observed .= join("\0", map { $_ // '' } @fields) . "\n";
     }
 
+    # The function returns the owned directories of the installed record, or the owned
+    # directories of the policy without a record. It does not include inspect-only parents.
+    my $expected_directories = [values %{ $policy->{directories} }];
+    $expected_directories = $installed->{directories} // [] if $installed;
+    my $directories = [];
+    for my $expected (sort { $a->{path} cmp $b->{path} } @$expected_directories) {
+        my $path = $check_destination->($expected->{path}, 'installed directory');
+        my $observation = observe_file($path);
+        my $directory = { path => $path, present => $observation->{present} };
+        for my $key (qw(mode owner group uid gid)) {
+            $directory->{$key} = $observation->{$key} if defined($observation->{$key});
+        }
+        $directory->{matches} = $directory_matches->($observation, $expected) if $installed;
+        push @$directories, $directory;
+        my @fields = ($path, @$observation{qw(present directory mode uid gid)});
+        $observed .= join("\0", 'directory', map { $_ // '' } @fields) . "\n";
+    }
+
     my $installed_fields = undef;
     $installed_fields = { map { $_ => $installed->{$_} } @$INSTALLED_KEYS } if $installed;
     return {
@@ -1939,6 +2010,7 @@ sub read_state {
         state => $state,
         installed => $installed_fields,
         files => $files,
+        directories => $directories,
         observed_sha256 => Digest::SHA::sha256_hex($observed),
         secrets => $secret_states->($policy),
     };

@@ -442,6 +442,54 @@ $check->(
     $state->{observed_sha256} eq $clean_digest,
 );
 
+# The tests check drift of an owned directory.
+
+my $owned_new = "$ROOT/etc/new";
+my $directory_entry = sub {
+    my ($current) = @_;
+
+    my ($entry) = grep { $_->{path} eq $owned_new } @{ $current->{directories} };
+    return $entry;
+};
+$check->(
+    'GET reports the owned directory as matching',
+    $directory_entry->($state)->{matches} && $directory_entry->($state)->{mode} eq '0750',
+);
+chmod(0755, $owned_new) or die "cannot change the mode of $owned_new: $!\n";
+my $files_before_directory_drift = snapshot(@all_paths);
+$state = get_state($target);
+$check->(
+    'GET reports that an owned directory with another mode does not match',
+    !$directory_entry->($state)->{matches} && $directory_entry->($state)->{mode} eq '0755',
+);
+$check->(
+    'the observed digest changes with directory drift',
+    $state->{observed_sha256} ne $clean_digest,
+);
+$check->('GET leaves the owned directory unchanged', directory_mode($owned_new) eq '0755');
+my $directory_repair_upid = install_archive($policy, $archive_one);
+$state = get_state($target);
+$check->(
+    'a repeat install restores the owned directory mode',
+    directory_mode($owned_new) eq '0750',
+);
+$check->(
+    'GET reports the repaired owned directory as matching',
+    $directory_entry->($state)->{matches},
+);
+$check->(
+    'the observed digest returns to its clean value after the directory repair',
+    $state->{observed_sha256} eq $clean_digest,
+);
+$check->(
+    'the directory repair leaves every file unchanged',
+    snapshot(@all_paths) eq $files_before_directory_drift,
+);
+$check->(
+    'the directory repair keeps every file write_id',
+    !grep { $_->{write_id} eq $directory_repair_upid } @{ $state->{files} },
+);
+
 # Identity and member rejections. Every rejection leaves the files unchanged.
 
 my $protected_paths = [@all_paths, $installed_path];

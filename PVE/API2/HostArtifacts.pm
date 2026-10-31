@@ -115,6 +115,18 @@ my $file_properties = {
     },
 };
 
+my $directory_properties = {
+    path => { type => 'string', description => 'The path is the absolute path of the directory.' },
+    present => { type => 'boolean', description => 'The value is true when the path exists.' },
+    map { $_ => $file_properties->{$_} } qw(mode owner group uid gid),
+    matches => {
+        type => 'boolean',
+        optional => 1,
+        description => 'The value is true when the path is a directory with the mode, owner, and'
+            . ' group of the installed record.',
+    },
+};
+
 __PACKAGE__->register_method({
     name => 'stage_host_artifact',
     path => '{target}/stage',
@@ -359,10 +371,19 @@ __PACKAGE__->register_method({
                     . ' Without a record, the array has one entry for each file in the policy.',
                 items => { type => 'object', properties => $file_properties },
             },
+            directories => {
+                type => 'array',
+                description => 'The array has one entry for each owned directory in the installed'
+                    . ' record. Without a record, the array has one entry for each owned'
+                    . ' directory in the policy. The array does not include inspect-only parent'
+                    . ' directories.',
+                items => { type => 'object', properties => $directory_properties },
+            },
             observed_sha256 => {
                 type => 'string',
                 description => 'The value is the SHA-256 of the path, presence, SHA-256, size,'
-                    . ' mode, owner, and group of every listed file.',
+                    . ' mode, owner, and group of every listed file and of the path, presence,'
+                    . ' type, mode, owner, and group of every listed directory.',
             },
             secrets => {
                 type => 'array',
@@ -377,7 +398,8 @@ __PACKAGE__->register_method({
                         },
                         configured => {
                             type => 'boolean',
-                            description => 'The value is true when the storage file exists.',
+                            description => 'The value is true when the storage file is a regular'
+                                . ' file with the mode, owner, and group of the policy.',
                         },
                         version => {
                             type => 'integer',
