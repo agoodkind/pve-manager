@@ -273,9 +273,9 @@ my $policy_document = HostArtifactsTest::base_policy(
     'suburban/host_artifact_test', $files_policy, $directories_policy,
 );
 my $target = HostArtifactsTest::write_policy($policy_document);
-my $unrelated_target = PVE::HostArtifacts::target_of_workspace('suburban/unrelated');
+my $invalid_target = PVE::HostArtifacts::target_of_workspace('suburban/unrelated');
 HostArtifactsTest::write_file(
-    PVE::HostArtifacts::policy_path($unrelated_target), "this is not JSON\n",
+    PVE::HostArtifacts::policy_path($invalid_target), "this is not JSON\n",
 );
 my $policy = PVE::HostArtifacts::load_policy($target);
 $check->(
@@ -325,6 +325,48 @@ $check_match->(
     qr/\Q$missing_target\E\.json does not exist/,
 );
 
+# The tests create two unrelated targets. One target has a committed install. The install of
+# the other target stops, and that target keeps its journal. After each install, rejection, and
+# recovery of another target, the tests compare the files, installed record, secret record,
+# journal, and lock file of both targets.
+
+my $unrelated_dir = "$ROOT/unrelated";
+my $unrelated_file = "$unrelated_dir/u.conf";
+my $unrelated_document = HostArtifactsTest::base_policy(
+    'suburban/observation-unrelated',
+    [{ path => $unrelated_file, mode => '0644', owner => 'root', group => 'root' }],
+    [{ path => $unrelated_dir, mode => '0750', owner => 'root', group => 'root' }],
+);
+my $unrelated_target = HostArtifactsTest::write_policy($unrelated_document);
+my $unrelated_policy = PVE::HostArtifacts::load_policy($unrelated_target);
+my $unrelated_archive = write_artifact(
+    'unrelated',
+    HostArtifactsTest::artifact(
+        $unrelated_document, { $unrelated_file => { content => "u\n" } },
+    ),
+);
+install_archive($unrelated_policy, $unrelated_archive);
+my ($stopped_target, $stopped_paths) = HostArtifactsTest::interrupted_target(
+    'suburban/observation-stopped', "$ROOT/stopped",
+);
+
+sub unrelated_state {
+    return $json->encode([
+        HostArtifactsTest::target_state($unrelated_target, $unrelated_dir, $unrelated_file),
+        HostArtifactsTest::target_state($stopped_target, @$stopped_paths),
+    ]);
+}
+my $unrelated_before = unrelated_state();
+my $check_unrelated = sub {
+    my ($label) = @_;
+
+    $check->(
+        "the files, records, journals, and lock files of the unrelated targets stay unchanged"
+            . " after $label",
+        unrelated_state() eq $unrelated_before,
+    );
+};
+
 # The first install.
 
 my $version_one = {
@@ -359,6 +401,7 @@ $check->(
     sprintf('%04o', $new_dir_stat[2] & 07777) eq '0750'
         && $new_dir_stat[5] == scalar(getgrnam('daemon')),
 );
+$check_unrelated->('the first install');
 
 # An identical install writes only the installed record.
 
@@ -388,6 +431,7 @@ $check->(
 );
 my @leftovers = list_leftovers("$ROOT/etc");
 $check->('an install leaves no temporary or backup file', !@leftovers, "@leftovers");
+$check_unrelated->('an identical install');
 
 # Drift readback.
 
@@ -441,39 +485,7 @@ $check->(
     'the observed digest returns to its clean value',
     $state->{observed_sha256} eq $clean_digest,
 );
-
-# The tests install an unrelated target and compare its files, installed record, journal, and
-# lock file after directory repair, install recovery, target B recovery, manifest rejection,
-# and owned directory recovery.
-
-my $unrelated_dir = "$ROOT/unrelated";
-my $unrelated_file = "$unrelated_dir/u.conf";
-my $unrelated_document = HostArtifactsTest::base_policy(
-    'suburban/observation-unrelated',
-    [{ path => $unrelated_file, mode => '0644', owner => 'root', group => 'root' }],
-    [{ path => $unrelated_dir, mode => '0750', owner => 'root', group => 'root' }],
-);
-my $unrelated_target = HostArtifactsTest::write_policy($unrelated_document);
-my $unrelated_policy = PVE::HostArtifacts::load_policy($unrelated_target);
-install_archive(
-    $unrelated_policy,
-    write_artifact(
-        'unrelated',
-        HostArtifactsTest::artifact($unrelated_document, { $unrelated_file => { content => "u\n" } }),
-    ),
-);
-my $unrelated_before =
-    HostArtifactsTest::target_state($unrelated_target, $unrelated_dir, $unrelated_file);
-my $check_unrelated = sub {
-    my ($label) = @_;
-
-    $check->(
-        "the unrelated target's files, record, journal, and lock file remain unchanged"
-            . " after the test of $label",
-        HostArtifactsTest::target_state($unrelated_target, $unrelated_dir, $unrelated_file) eq
-            $unrelated_before,
-    );
-};
+$check_unrelated->('the file drift repair');
 
 # The tests check drift of an owned directory.
 
@@ -557,6 +569,7 @@ sub check_rejected {
         $label, sub { install_archive($policy, $archive_path, %request_override) }, $pattern,
     );
     $check->("$label leaves the files unchanged", snapshot(@$protected_paths) eq $before);
+    $check_unrelated->("the rejection of $label");
 }
 
 my $version_two = { map { $_ => { %{ $version_one->{$_} } } } keys %$version_one };
@@ -855,6 +868,7 @@ $check->(
     'a rejected task leaves the files unchanged',
     snapshot(@$protected_paths) eq $before_task,
 );
+$check_unrelated->('the rejected task');
 
 # An interrupted transaction and the journal restore.
 
@@ -958,6 +972,7 @@ $check->(
     'the next install writes every file',
     !grep { !$_->{matches} || $_->{write_id} ne $resumed_upid } @{ $resumed_state->{files} },
 );
+$check_unrelated->('the next install');
 
 # An empty manifest deletes the files of the target.
 
@@ -969,6 +984,7 @@ $check->(
     'an empty manifest leaves an empty installed record',
     $empty_state->{state} eq 'committed' && !@{ $empty_state->{files} },
 );
+$check_unrelated->('the empty manifest');
 
 sub recover_target {
     my ($policy) = @_;
@@ -1017,6 +1033,7 @@ $check->('recovery deletes the journal of the setgid directory', !-e $setgid_jou
 $check->('recovery does not leave any new file', !grep { -e $_ } @$setgid_paths);
 install_archive($setgid_policy, $setgid_one);
 $check->('the next install sets the policy mode', directory_mode($setgid_dir) eq '0755');
+$check_unrelated->('the killed install and its recovery');
 
 chmod(02755, $setgid_dir) or die "cannot change the mode of $setgid_dir: $!\n";
 my $stopped_error = stop_install($setgid_policy, $setgid_two, 'TERM', sub { -e $setgid_journal });
@@ -1031,6 +1048,7 @@ $check->(
     'a stopped install keeps the earlier content',
     count_with_prefix($setgid_paths, 'one') == $INTERRUPT_FILE_COUNT,
 );
+$check_unrelated->('the stopped install');
 
 # The tests check rollback of new files and a created directory.
 
@@ -1054,6 +1072,7 @@ $check->(
 recover_target($fresh_policy);
 $check->('recovery deletes every new file', !grep { -e $_ } @$fresh_paths);
 $check->('recovery deletes the created directory', !-e $fresh_dir);
+$check_unrelated->('the rollback of new files');
 
 # The tests check root ownership of the policy file.
 
@@ -1135,6 +1154,7 @@ $check->(
     'GET reports the file under the directory of another owner as matching',
     files_by_path(get_state($owned_policy->{target}))->{$owned_file}->{matches},
 );
+$check_unrelated->('the installs with a directory of another owner');
 
 # The tests check stage size limits.
 
@@ -1261,6 +1281,7 @@ $check->(
     'GET reports every file as matching after concurrent installs',
     $lock_state->{state} eq 'committed' && !grep { !$_->{matches} } @{ $lock_state->{files} },
 );
+$check_unrelated->('the concurrent installs');
 
 # The tests check two targets that share an inspect-only parent directory.
 
@@ -1417,6 +1438,14 @@ $check_error->(
     'policy loading rejects a path in directories and in parent_directories',
     sub { PVE::HostArtifacts::load_policy($overlap_target) },
     qr/in directories and in parent_directories/,
+);
+
+# The stopped target keeps its journal and uses that journal to restore its files.
+
+recover_target({ target => $stopped_target });
+$check->(
+    'the stopped target restores its files from its own journal',
+    !-e "$STATE_DIR/$stopped_target/journal.json" && !grep { -e $_ } @$stopped_paths,
 );
 
 remove_tree($ROOT, $WORK);

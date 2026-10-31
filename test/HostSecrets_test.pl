@@ -252,6 +252,9 @@ install_file(
 );
 my $other_status = set_secret($other_target, $OTHER_FIELD, value('other'), 1);
 $check->('the unrelated target sets its field', $other_status eq 'OK', $other_status);
+my ($stopped_target, $stopped_paths) = HostArtifactsTest::interrupted_target(
+    'suburban/secret-stopped', "$ROOT/stopped",
+);
 
 # The function returns the unrelated state that every request for the selected field leaves
 # unchanged.
@@ -262,6 +265,7 @@ sub unrelated_state {
         other_target => HostArtifactsTest::target_state(
             $other_target, $other_artifact_file, $other_secret_file,
         ),
+        stopped_target => HostArtifactsTest::target_state($stopped_target, @$stopped_paths),
         other_consumer => unit_property($OTHER_CONSUMER, 'InvocationID'),
         unrelated => unit_property($UNRELATED, 'InvocationID'),
     });
@@ -271,8 +275,8 @@ my $check_unrelated = sub {
     my ($label) = @_;
 
     $check->(
-        "the unrelated files, records, journal, lock file, and units remain unchanged"
-            . " after the test of $label",
+        "the files, records, journals, and lock files of the unrelated targets and the"
+            . " InvocationID values of the unrelated consumer units stay unchanged after $label",
         unrelated_state() eq $unrelated_before,
     );
 };
@@ -284,6 +288,7 @@ for my $user ('auditor@pve', 'deploy@pve!audit', 'deploy@pve!install') {
     $check->("$user cannot set a secret", $response->{status} == 403);
 }
 $check->('the denied requests do not create the storage file', !-e $secret_file);
+$check_unrelated->('the denied requests');
 
 # The tests check version 1.
 
@@ -571,6 +576,16 @@ $check->(
 );
 run_systemctl('start', $CONSUMER);
 $check_unrelated->('the retry after an operator stop');
+
+# The stopped target keeps its journal and uses that journal to restore its files.
+
+PVE::HostArtifacts::with_target_lock(
+    $stopped_target, sub { PVE::HostArtifacts::recover($stopped_target) },
+);
+$check->(
+    'the stopped target restores its files from its own journal',
+    !-e "$STATE_DIR/$stopped_target/journal.json" && !grep { -e $_ } @$stopped_paths,
+);
 
 # The tests check logs, responses, and records.
 

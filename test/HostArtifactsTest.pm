@@ -4,7 +4,7 @@ use strict;
 use warnings;
 
 use Digest::SHA;
-use File::Path qw(make_path);
+use File::Path qw(make_path remove_tree);
 use IO::Compress::Gzip qw(gzip $GzipError);
 use JSON;
 use MIME::Base64 qw(encode_base64);
@@ -19,10 +19,13 @@ use PVE::ProcFSTools;
 use PVE::Tools;
 
 my $TARGET_POLICY_DIR = '/etc/pve-overlay/host-artifacts/targets';
+my $STATE_DIR = '/var/lib/pve-overlay/host-artifacts';
 my $TASK_DIR = '/var/log/pve/tasks';
 my $CHUNK_BYTES = 96 * 1024;
 my $TASK_TIMEOUT_SECONDS = 300;
 my $TAR_BLOCK_BYTES = 512;
+my $INTERRUPT_FILE_COUNT = 300;
+my $INTERRUPT_TIMEOUT_SECONDS = 120;
 
 my $json = JSON->new->utf8->canonical;
 
@@ -273,7 +276,7 @@ sub check {
 sub target_state {
     my ($target, @paths) = @_;
 
-    my $state_dir = "/var/lib/pve-overlay/host-artifacts/$target";
+    my $state_dir = "$STATE_DIR/$target";
     my $state = {};
     for my $path (
         @paths,
@@ -291,6 +294,57 @@ sub target_state {
         $state->{$path} = join(':', $digest, @stat[1, 2, 4, 5, 7, 9]);
     }
     return $json->encode($state);
+}
+
+# The function creates a target with many files and starts its install in a child process. It
+# kills the child after the first file appears, and the target keeps its journal. The function
+# returns the target and the file paths.
+sub interrupted_target {
+    my ($workspace, $dir) = @_;
+
+    make_path($dir, { mode => 0755 });
+    my $paths = [map { sprintf('%s/file-%04d.conf', $dir, $_) } 1 .. $INTERRUPT_FILE_COUNT];
+    my $document = base_policy(
+        $workspace,
+        [map { { path => $_, mode => '0644', owner => 'root', group => 'root' } } @$paths],
+    );
+    my $target = write_policy($document);
+    remove_tree("$STATE_DIR/$target");
+    my $policy = PVE::HostArtifacts::load_policy($target);
+    my ($manifest, $members) =
+        artifact($document, { map { $_ => { content => "$_\n" } } @$paths });
+    my $archive = "$dir.tar.gz";
+    write_archive(
+        $archive, [{ name => 'manifest.json', content => $json->encode($manifest) }, @$members],
+    );
+    my $request = request($archive);
+
+    my $pid = fork() // die "the process cannot fork: $!\n";
+    if (!$pid) {
+        open(STDOUT, '>', '/dev/null') or POSIX::_exit(2);
+        eval {
+            PVE::HostArtifacts::with_target_lock(
+                $target,
+                sub {
+                    PVE::HostArtifacts::install_verified_archive(
+                        $policy, $request, $archive, 'UPID:test:interrupted', 'deploy@pve!install',
+                    );
+                },
+            );
+        };
+        POSIX::_exit($@ ? 1 : 0);
+    }
+    my $deadline = Time::HiRes::time() + $INTERRUPT_TIMEOUT_SECONDS;
+    while (!-e $paths->[0]) {
+        last if Time::HiRes::time() > $deadline;
+        last if waitpid($pid, POSIX::WNOHANG()) == $pid;
+        Time::HiRes::sleep(0.0005);
+    }
+    kill('KILL', $pid);
+    waitpid($pid, 0);
+    die "the stopped install of $workspace does not have a journal\n"
+        if !-e "$STATE_DIR/$target/journal.json";
+    return ($target, $paths);
 }
 
 sub check_match {
