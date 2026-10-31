@@ -562,8 +562,6 @@ my $stage_length = sub {
     return $stat[7];
 };
 
-# The function checks that the stage exists for the target and matches the user and kind.
-# The function returns the stage record.
 sub check_stage {
     my ($target, $stage, $user, $kind) = @_;
 
@@ -639,8 +637,6 @@ my $append_chunk = sub {
     close($handle) or die "cannot close $path: $!\n";
 };
 
-# The function adds one chunk to a stage. Offset 0 creates a new stage. Every other offset
-# must equal the current length of the stage.
 sub stage_chunk {
     my ($target, $user, $kind, $offset, $data, $stage) = @_;
 
