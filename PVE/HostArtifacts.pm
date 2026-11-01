@@ -298,8 +298,7 @@ my $check_root_owned = sub {
     }
 };
 
-# The function validates the secret fields of a policy. Each field has its own storage file
-# outside the policy files and directories. The function anchors the pattern at both ends.
+# Artifact installation and secret rotation use different storage paths.
 my $check_secret_fields = sub {
     my ($list, $label, $files, $directories) = @_;
 
@@ -513,8 +512,6 @@ my $write_all = sub {
     }
 };
 
-# The function writes a temporary file in the same directory, syncs it, and renames it to
-# the destination. The function then syncs the directory.
 my $write_file_atomic = sub {
     my ($path, $content, $mode) = @_;
 
