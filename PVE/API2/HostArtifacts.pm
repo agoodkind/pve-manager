@@ -209,8 +209,9 @@ __PACKAGE__->register_method({
     permissions => {
         check => ['perm', '/nodes/{node}', ['Sys.HostArtifacts.Modify']],
     },
-    description => 'The hostartifact task verifies a staged archive with its staged'
-        . ' attestation bundle and installs its files.',
+    description => 'The hostartifact task restores an interrupted install, verifies a staged'
+        . ' archive and each program archive with their staged attestation bundles, and'
+        . ' installs the files and programs.',
     parameters => {
         additionalProperties => 0,
         properties => {
@@ -381,6 +382,25 @@ __PACKAGE__->register_method({
                     upid => { type => 'string' },
                     user => { type => 'string' },
                     installed_at => { type => 'string' },
+                    programs => {
+                        type => 'array',
+                        optional => 1,
+                        description => 'The array has one entry for each program in the'
+                            . ' installed manifest. An installed record without programs does'
+                            . ' not have this field.',
+                        items => {
+                            type => 'object',
+                            properties => {
+                                name => { type => 'string' },
+                                repository => { type => 'string' },
+                                release_tag => { type => 'string' },
+                                asset => { type => 'string' },
+                                sha256 => { type => 'string' },
+                                source_revision => { type => 'string' },
+                                signer_revision => { type => 'string' },
+                            },
+                        },
+                    },
                 },
             },
             files => {

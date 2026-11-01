@@ -992,20 +992,17 @@ for my $stage (
     $record->{created} -= $OLD_STAGE_SECONDS;
     HostArtifactsTest::write_file($record_path, $json->encode($record), 0600);
 }
-interrupt_install(
-    $many_policy,
-    $many_archive_two,
-    \@many_paths,
-    archive_stage => $listed_stage,
-    program_stages => [
-        {
-            name => 'tool',
-            archive_stage => $listed_program_stage,
-            bundle_stage => $listed_program_bundle,
-        },
-    ],
-);
+interrupt_install($many_policy, $many_archive_two, \@many_paths, archive_stage => $listed_stage);
 $check->('the second interruption left a journal', -e $many_journal);
+my $journal_with_programs = $json->decode(HostArtifactsTest::read_file($many_journal));
+$journal_with_programs->{program_stages} = [
+    {
+        name => 'tool',
+        archive_stage => $listed_program_stage,
+        bundle_stage => $listed_program_bundle,
+    },
+];
+HostArtifactsTest::write_file($many_journal, $json->encode($journal_with_programs), 0600);
 my $new_stage =
     HostArtifactsTest::stage_file($rpcenv, $TOKEN, $many_target, 'bundle', "new bundle\n");
 $check->(
@@ -1581,9 +1578,9 @@ my $program_task = $program_install->($valid_program_stages);
 $check->('a valid program request starts a task', $program_task->{status} == 200);
 my ($program_task_status) = HostArtifactsTest::wait_for_task($program_task->{data});
 $check_match->(
-    'a program request task fails with an error that the host cannot install programs',
+    'a program request task fails when gh rejects the configuration bundle',
     $program_task_status,
-    qr/this host cannot install programs yet/,
+    qr/gh attestation verify exited with code [1-9]/,
 );
 $check->(
     'the failed program task does not write an installed record or a journal',
@@ -1596,6 +1593,260 @@ $check->(
         ($tool_archive, $tool_bundle, $helper_archive, $helper_bundle),
 );
 $check_unrelated->('the program task fails');
+
+# The tests check schema 2 manifests and program archives without gh. The attestation test runs
+# the install with the attested program archives.
+
+my $schema_two_dir = "$ROOT/schema-two";
+make_path($schema_two_dir, { mode => 0755 });
+my $schema_two_file = "$schema_two_dir/s.conf";
+my $schema_two_secret = "$schema_two_dir/secret.env";
+my $schema_two_document =
+    HostArtifactsTest::base_policy('suburban/schema-two', file_entries([$schema_two_file]));
+$schema_two_document->{programs} = [program_entry('tool')];
+$schema_two_document->{secret_fields} = [
+    {
+        name => 'SCHEMA_TOKEN',
+        storage_path => $schema_two_secret,
+        mode => '0600',
+        owner => 'root',
+        group => 'root',
+        pattern => '[a-z]+',
+        min_length => 1,
+        max_length => 64,
+        consumer_units => [],
+    },
+];
+my $schema_two_target = HostArtifactsTest::write_policy($schema_two_document);
+my $schema_two_policy = PVE::HostArtifacts::load_policy($schema_two_target);
+my $tool_bytes = "tool executable\n";
+my $tool_sha256 = Digest::SHA::sha256_hex($tool_bytes);
+my $tool_references = [{ name => 'tool', archive_stage => '2' x 32, bundle_stage => '3' x 32 }];
+
+sub manifest_program {
+    my (%override) = @_;
+
+    return {
+        name => 'tool',
+        repository => 'agoodkind/example',
+        release_tag => '202610300000-1-bbbbbbb',
+        asset => 'tool_linux_amd64.tar.gz',
+        sha256 => 'c' x 64,
+        source_revision => 'd' x 40,
+        signer_revision => 'e' x 40,
+        member => 'tool',
+        member_sha256 => $tool_sha256,
+        path => "$ROOT/programs/tool",
+        mode => '0755',
+        owner => 'root',
+        group => 'root',
+        %override,
+    };
+}
+
+my $schema_two_archive = sub {
+    my ($change) = @_;
+
+    my ($manifest, $members) = HostArtifactsTest::artifact(
+        $schema_two_document, { $schema_two_file => { content => "s\n" } },
+    );
+    $manifest->{schema_version} = 2;
+    $manifest->{programs} = [manifest_program()];
+    $change->($manifest) if $change;
+    return write_artifact('schema-two', $manifest, $members);
+};
+my $validate_schema_two = sub {
+    my ($archive_path, $references) = @_;
+
+    my $request = HostArtifactsTest::request($archive_path, program_stages => $references);
+    return PVE::HostArtifacts::validate_archive($schema_two_policy, $request, $archive_path);
+};
+
+my $tool_program =
+    $validate_schema_two->($schema_two_archive->(), $tool_references)->{programs}->{tool};
+$check->(
+    'validate_archive returns the executable file entry of a schema 2 program',
+    $tool_program->{file}->{path} eq "$ROOT/programs/tool"
+        && $tool_program->{file}->{member} eq 'tool'
+        && $tool_program->{file}->{sha256} eq $tool_sha256,
+);
+
+my $replace_program = sub {
+    my (%override) = @_;
+
+    return sub { $_[0]->{programs} = [manifest_program(%override)] };
+};
+my $schema_two_cases = [
+    [
+        'the request does not have a stage for a manifest program',
+        undef,
+        [],
+        qr/the manifest lists the program tool, and the request does not have a stage for it/,
+    ],
+    [
+        'the request has a stage for a program and the manifest has schema 1',
+        sub {
+            $_[0]->{schema_version} = 1;
+            delete $_[0]->{programs};
+        },
+        $tool_references,
+        qr/the request has a stage for the program tool, and the manifest does not list it/,
+    ],
+    [
+        'the request has a stage for a program that the manifest does not list',
+        sub { $_[0]->{programs} = [] },
+        $tool_references,
+        qr/the request has a stage for the program tool, and the manifest does not list it/,
+    ],
+    [
+        'the policy does not list a manifest program',
+        $replace_program->(name => 'other'),
+        [{ %{ $tool_references->[0] }, name => 'other' }],
+        qr/does not list the program other/,
+    ],
+    [
+        'a program repository differs from its policy entry',
+        $replace_program->(repository => 'agoodkind/other'),
+        $tool_references,
+        qr/manifest repository of the program tool is 'agoodkind\/other'/,
+    ],
+    [
+        'a program path differs from its policy entry',
+        $replace_program->(path => "$ROOT/programs/other"),
+        $tool_references,
+        qr/program tool does not match the path, mode, owner, and group in the policy/,
+    ],
+    [
+        'a program mode differs from its policy entry',
+        $replace_program->(mode => '0700'),
+        $tool_references,
+        qr/program tool does not match the path, mode, owner, and group in the policy/,
+    ],
+    [
+        'a program owner differs from its policy entry',
+        $replace_program->(owner => 'daemon'),
+        $tool_references,
+        qr/program tool does not match the path, mode, owner, and group in the policy/,
+    ],
+    [
+        'a program group differs from its policy entry',
+        $replace_program->(group => 'daemon'),
+        $tool_references,
+        qr/program tool does not match the path, mode, owner, and group in the policy/,
+    ],
+    [
+        'a program path equals a target file path',
+        $replace_program->(path => $schema_two_file),
+        $tool_references,
+        qr/matches a file path or a secret storage path of this target/,
+    ],
+    [
+        'a program path equals a secret storage path of the target',
+        $replace_program->(path => $schema_two_secret),
+        $tool_references,
+        qr/matches a file path or a secret storage path of this target/,
+    ],
+    [
+        'the manifest repeats a program',
+        sub { push @{ $_[0]->{programs} }, manifest_program() },
+        $tool_references,
+        qr/lists the program tool more than once/,
+    ],
+    [
+        'a program has an unknown field',
+        $replace_program->(extra => 1),
+        $tool_references,
+        qr/unknown field 'extra'/,
+    ],
+    [
+        'a program lacks a field',
+        sub { delete $_[0]->{programs}->[0]->{signer_revision} },
+        $tool_references,
+        qr/'signer_revision' is missing/,
+    ],
+    [
+        'a program member has a parent component',
+        $replace_program->(member => '../tool'),
+        $tool_references,
+        qr/has an empty, '\.', or '\.\.' component/,
+    ],
+    [
+        'the programs field is not a list',
+        sub { $_[0]->{programs} = {} },
+        $tool_references,
+        qr/the manifest programs field is not a JSON array/,
+    ],
+    [
+        'a schema 2 manifest lacks the programs field',
+        sub { delete $_[0]->{programs} },
+        $tool_references,
+        qr/the manifest programs field is not a JSON array/,
+    ],
+    [
+        'the manifest has an unknown schema',
+        sub {
+            $_[0]->{schema_version} = 3;
+            delete $_[0]->{programs};
+        },
+        $tool_references,
+        qr/the manifest schema_version is neither 1 nor 2/,
+    ],
+];
+for my $case (@$schema_two_cases) {
+    my ($label, $change, $references, $pattern) = @$case;
+    my $case_archive = $schema_two_archive->($change);
+    $check_error->(
+        "validate_archive rejects the manifest when $label",
+        sub { $validate_schema_two->($case_archive, $references) },
+        $pattern,
+    );
+}
+$check_unrelated->('validate_archive rejects invalid schema 2 manifests');
+
+my $tool_member = { name => 'tool', content => $tool_bytes, mode => 0755 };
+my $readme_member = { name => 'README.md', content => "readme text\n" };
+my $tool_archive_file = sub {
+    my ($name, $members) = @_;
+
+    my $path = "$WORK/$name.tar.gz";
+    HostArtifactsTest::write_archive($path, $members);
+    return $path;
+};
+my $valid_tool_archive = $tool_archive_file->('tool-valid', [$tool_member, $readme_member]);
+PVE::HostArtifacts::check_program_archive($tool_program, $valid_tool_archive);
+$check->(
+    'check_program_archive selects the executable member when the archive also contains README.md',
+    $tool_program->{file}->{size} == length($tool_bytes)
+        && $tool_program->{file}->{archive_path} eq $valid_tool_archive,
+);
+my $tool_archive_cases = [
+    ['an absent member', [$readme_member], qr/does not contain the member 'tool'/],
+    [
+        'a duplicated member',
+        [$tool_member, $tool_member],
+        qr/lists the member 'tool' more than once/,
+    ],
+    [
+        'a link member',
+        [{ name => 'tool', type => '2', linkname => '/etc/shadow' }],
+        qr/member 'tool' is not a regular file/,
+    ],
+    [
+        'changed member bytes',
+        [{ %$tool_member, content => "changed\n" }],
+        qr/member 'tool' of the program tool has SHA-256 [0-9a-f]{64}, and the manifest lists/,
+    ],
+];
+for my $case (@$tool_archive_cases) {
+    my ($label, $members, $pattern) = @$case;
+    my $case_archive = $tool_archive_file->('tool-case', $members);
+    $check_error->(
+        "check_program_archive rejects $label",
+        sub { PVE::HostArtifacts::check_program_archive($tool_program, $case_archive) },
+        $pattern,
+    );
+}
+$check_unrelated->('check_program_archive rejects invalid program archives');
 
 # The tests check installs of one target under the target lock.
 
