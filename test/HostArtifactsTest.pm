@@ -247,7 +247,6 @@ sub stage_file {
     return $stage;
 }
 
-# The function waits until the task of the UPID exits and returns its status line and log.
 sub wait_for_task {
     my ($upid) = @_;
 
@@ -269,9 +268,6 @@ sub check {
     print "OK: $label\n";
 }
 
-# The function returns the content and metadata of the listed files and of the installed record,
-# secret record, journal, and lock file of one target. A test compares the result before and
-# after a request for another target.
 sub target_state {
     my ($target, @paths) = @_;
 

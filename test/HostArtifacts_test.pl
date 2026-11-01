@@ -199,7 +199,6 @@ sub stop_install {
     return $error;
 }
 
-# The function writes the policy of a new target and returns the policy document and loaded policy.
 sub new_target {
     my ($workspace, $files, $directories, $parents) = @_;
 
