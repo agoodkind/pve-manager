@@ -298,7 +298,7 @@ my $check_root_owned = sub {
     }
 };
 
-# Artifact installation and secret rotation use different storage paths.
+# Secret storage paths must differ from artifact file and directory paths.
 my $check_secret_fields = sub {
     my ($list, $label, $files, $directories) = @_;
 

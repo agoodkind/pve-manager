@@ -499,7 +499,6 @@ $check->(
     secret_state($target, $FIELD)->{restart_pending} eq '1',
 );
 
-# The function returns the storage file and secret record state of the selected target.
 sub secret_files_state {
     return join(' ', file_state($secret_file), file_state("$STATE_DIR/$target/secrets.json"));
 }
