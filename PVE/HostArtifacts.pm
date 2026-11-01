@@ -59,9 +59,16 @@ my $STATE_FILE_MODE = 0600;
 my $STATE_DIR_MODE = 0700;
 
 my $SCHEMA_VERSION = 1;
+my $PROGRAM_SCHEMA_VERSION = 2;
 my $MANIFEST_MEMBER = 'manifest.json';
 my $FILES_PREFIX = 'files/';
-my $STAGE_KINDS = { archive => 'max_archive_bytes', bundle => 'max_bundle_bytes' };
+my $STAGE_KINDS = {
+    archive => 'max_archive_bytes',
+    bundle => 'max_bundle_bytes',
+    program => 'max_archive_bytes',
+    'program-bundle' => 'max_bundle_bytes',
+};
+my $PROGRAM_STAGE_KINDS = { program => 1, 'program-bundle' => 1 };
 
 my $TARGET_RE = qr/[0-9a-f]{64}/;
 my $STAGE_RE = qr/[0-9a-f]{32}/;
@@ -79,21 +86,36 @@ my $BASE64_RE = qr{(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)
 my $SECRET_FIELD_RE = qr/[A-Z_][A-Z0-9_]{0,63}/;
 my $UNIT_RE = qr/[A-Za-z0-9][A-Za-z0-9@._:-]{0,246}\.service/;
 my $VERSION_RE = qr/[1-9][0-9]{0,15}/;
+my $PROGRAM_NAME_RE = qr/[a-z][a-z0-9-]*/;
 
 my $POLICY_KEYS = [
     qw(workspace node environment configuration directories parent_directories files
-        secret_fields)
+        secret_fields programs)
 ];
 my $SECRET_FIELD_KEYS =
     [qw(name storage_path mode owner group pattern min_length max_length consumer_units)];
+my $PROGRAM_KEYS = [
+    qw(name repository workflow_uri source_ref path mode owner group max_archive_bytes
+        max_bundle_bytes)
+];
 my $CONFIGURATION_KEYS =
     [qw(repository workflow_uri source_ref signer_digest max_archive_bytes max_bundle_bytes)];
 my $ENTRY_KEYS = [qw(path mode owner group)];
 my $MANIFEST_KEYS =
     [qw(schema_version repository source_revision workspace node environment directories files)];
+my $MANIFEST_KEYS_BY_SCHEMA = {
+    $SCHEMA_VERSION => $MANIFEST_KEYS,
+    $PROGRAM_SCHEMA_VERSION => [@$MANIFEST_KEYS, 'programs'],
+};
 my $MANIFEST_FILE_KEYS = [qw(member path size sha256 mode owner group)];
+my $MANIFEST_PROGRAM_KEYS = [
+    qw(name repository release_tag asset sha256 source_revision signer_revision member
+        member_sha256 path mode owner group)
+];
 my $INSTALLED_KEYS =
     [qw(release_tag asset sha256 source_revision manifest_sha256 upid user installed_at)];
+my $INSTALLED_PROGRAM_KEYS =
+    [qw(name repository release_tag asset sha256 source_revision signer_revision)];
 
 my $json = JSON->new->utf8->canonical;
 
@@ -133,6 +155,14 @@ my $check_count = sub {
     die "$label field '$key' is not a nonnegative integer\n"
         if ref($value) || $value !~ m/\A(0|[1-9][0-9]{0,15})\z/;
     return $1 + 0;
+};
+
+my $check_positive_count = sub {
+    my ($hash, $key, $label) = @_;
+
+    my $value = $check_count->($hash, $key, $label);
+    die "$label field '$key' is not a positive integer\n" if $value < 1;
+    return $value;
 };
 
 my $random_hex = sub {
@@ -354,6 +384,44 @@ my $check_secret_fields = sub {
     return $fields;
 };
 
+my $check_programs = sub {
+    my ($list, $label, $reserved, $target) = @_;
+
+    die "$label is not a JSON array\n" if ref($list) ne 'ARRAY';
+    my $programs = {};
+    my $paths = {};
+    for my $index (0 .. $#$list) {
+        my $raw = $list->[$index];
+        my $entry_label = "$label\[$index\]";
+        $check_keys->($raw, $PROGRAM_KEYS, $entry_label);
+        my $name = $check_string->($raw, 'name', $PROGRAM_NAME_RE, $entry_label);
+        die "$label lists the program $name more than once\n" if $programs->{$name};
+        my $path = $check_destination->($raw->{path}, "$entry_label path");
+        die "$label lists the path $path more than once\n" if $paths->{$path}++;
+        die "$entry_label path $path is also a policy file, a policy directory, or a secret"
+            . " storage path\n"
+            if $reserved->{$path};
+
+        $programs->{$name} = {
+            target => $target,
+            name => $name,
+            repository => $check_string->($raw, 'repository', $REPOSITORY_RE, $entry_label),
+            workflow_uri =>
+                $check_string->($raw, 'workflow_uri', $WORKFLOW_URI_RE, $entry_label),
+            source_ref => $check_string->($raw, 'source_ref', $SOURCE_REF_RE, $entry_label),
+            path => $path,
+            mode => $check_string->($raw, 'mode', $MODE_RE, $entry_label),
+            owner => $check_string->($raw, 'owner', $ACCOUNT_RE, $entry_label),
+            group => $check_string->($raw, 'group', $ACCOUNT_RE, $entry_label),
+            max_archive_bytes =>
+                $check_positive_count->($raw, 'max_archive_bytes', $entry_label),
+            max_bundle_bytes =>
+                $check_positive_count->($raw, 'max_bundle_bytes', $entry_label),
+        };
+    }
+    return $programs;
+};
+
 sub policy_path {
     my ($target) = @_;
 
@@ -385,6 +453,7 @@ sub load_policy {
     my $configuration_label = "$label configuration";
     $check_keys->($configuration, $CONFIGURATION_KEYS, $configuration_label);
     my $checked_configuration = {
+        target => $target,
         repository => $check_string->(
             $configuration, 'repository', $REPOSITORY_RE, $configuration_label,
         ),
@@ -426,6 +495,13 @@ sub load_policy {
         $files,
         { %$directories, %$parents },
     );
+    my $reserved = { %$files, %$directories, %$parents };
+    for my $field (values %$secret_fields) {
+        $reserved->{ $field->{path} } = $field;
+    }
+    my $programs = $check_programs->(
+        $document->{programs} // [], "$label programs", $reserved, $target,
+    );
 
     return {
         target => $target,
@@ -438,6 +514,7 @@ sub load_policy {
         parents => $parents,
         files => $files,
         secret_fields => $secret_fields,
+        programs => $programs,
     };
 }
 
@@ -538,10 +615,14 @@ my $read_stage_record = sub {
         || !defined($record->{user})
         || !defined($record->{kind})
         || !defined($record->{created});
+    die "the stage record $record_path is not valid\n"
+        if $PROGRAM_STAGE_KINDS->{ $record->{kind} }
+        && (!defined($record->{program}) || ($record->{target} // '') ne $target);
     return {
         stage => $stage,
         user => $record->{user},
         kind => $record->{kind},
+        program => $record->{program},
         created => $record->{created},
         data_path => $stage_dir->($target) . "/$stage",
         record_path => $record_path,
@@ -558,12 +639,14 @@ my $stage_length = sub {
 };
 
 sub check_stage {
-    my ($target, $stage, $user, $kind) = @_;
+    my ($target, $stage, $user, $kind, $program) = @_;
 
     my $record = $read_stage_record->($target, $stage);
     die "stage $stage does not exist for this target\n" if !$record;
     die "stage $stage belongs to another user\n" if $record->{user} ne $user;
     die "stage $stage has the kind $record->{kind}, not $kind\n" if $record->{kind} ne $kind;
+    die "stage $stage belongs to another program\n"
+        if ($record->{program} // '') ne ($program // '');
     $stage_length->($record);
     return $record;
 }
@@ -591,6 +674,7 @@ my $read_journal = sub {
         if ref($journal) ne 'HASH'
         || ref($journal->{files}) ne 'ARRAY'
         || ref($journal->{directories}) ne 'ARRAY'
+        || ref($journal->{program_stages} // []) ne 'ARRAY'
         || !defined($journal->{phase});
     return $journal;
 };
@@ -605,6 +689,10 @@ my $expire_stages = sub {
     if ($journal) {
         for my $key (qw(archive_stage bundle_stage)) {
             $referenced->{ $journal->{$key} } = 1 if defined($journal->{$key});
+        }
+        for my $reference (@{ $journal->{program_stages} // [] }) {
+            $referenced->{ $reference->{archive_stage} } = 1;
+            $referenced->{ $reference->{bundle_stage} } = 1;
         }
     }
 
@@ -632,16 +720,35 @@ my $append_chunk = sub {
     close($handle) or die "cannot close $path: $!\n";
 };
 
-sub stage_chunk {
-    my ($target, $user, $kind, $offset, $data, $stage) = @_;
+my $program_entry = sub {
+    my ($policy, $program) = @_;
 
-    die "the stage kind is not archive or bundle\n"
+    my $entry = $policy->{programs}->{$program};
+    die "the policy of this target does not list the program $program\n" if !$entry;
+    return $entry;
+};
+
+my $stage_limits = sub {
+    my ($policy, $kind, $program) = @_;
+
+    if (!$PROGRAM_STAGE_KINDS->{$kind}) {
+        die "the kind $kind rejects parameter 'program'\n" if defined($program);
+        return $policy->{configuration};
+    }
+    die "the kind $kind requires parameter 'program'\n" if !defined($program);
+    return $program_entry->($policy, $program);
+};
+
+sub stage_chunk {
+    my ($target, $user, $kind, $offset, $data, $stage, $program) = @_;
+
+    die "the stage kind is not archive, bundle, program, or program-bundle\n"
         if !defined($kind) || !$STAGE_KINDS->{$kind};
-    $kind = $untaint->($kind, qr/archive|bundle/, 'kind');
+    $kind = $untaint->($kind, qr/archive|bundle|program|program-bundle/, 'kind');
     $offset = $untaint->($offset, qr/[0-9]{1,16}/, 'offset') + 0;
     my $policy = load_policy($target);
     check_node($policy);
-    my $limit = $policy->{configuration}->{ $STAGE_KINDS->{$kind} };
+    my $limit = $stage_limits->($policy, $kind, $program)->{ $STAGE_KINDS->{$kind} };
     die "parameter 'data' is not valid base64\n" if $data !~ m/\A$BASE64_RE\z/;
     my $bytes = decode_base64($data);
 
@@ -657,16 +764,17 @@ sub stage_chunk {
                 die "the $kind is larger than $limit bytes\n" if length($bytes) > $limit;
                 my $new_stage = substr($random_hex->(), 0, 32);
                 my $record_path = $stage_dir->($policy->{target}) . "/$new_stage.json";
-                $write_file_atomic->(
-                    $record_path,
-                    $json->encode({ user => $user, kind => $kind, created => time() }),
-                    $STATE_FILE_MODE,
-                );
+                my $fields = { user => $user, kind => $kind, created => time() };
+                if ($PROGRAM_STAGE_KINDS->{$kind}) {
+                    $fields->{target} = $policy->{target};
+                    $fields->{program} = $program;
+                }
+                $write_file_atomic->($record_path, $json->encode($fields), $STATE_FILE_MODE);
                 $record = $read_stage_record->($policy->{target}, $new_stage);
                 $append_chunk->($record->{data_path}, $bytes, O_WRONLY | O_CREAT | O_EXCL);
             } else {
                 die "parameter 'stage' is required at offset $offset\n" if !defined($stage);
-                $record = check_stage($policy->{target}, $stage, $user, $kind);
+                $record = check_stage($policy->{target}, $stage, $user, $kind, $program);
                 my $length = $stage_length->($record);
                 die "offset $offset does not equal the stage length $length\n"
                     if $offset != $length;
@@ -732,18 +840,18 @@ my $run_gh = sub {
     return ($status, $stdout, $stderr);
 };
 
-# The function runs gh attestation verify offline with the policy identity, the trusted root,
-# and the bundle. Every verified statement must have a subject with the requested asset name
-# and SHA-256, and the SHA-256 of the archive must equal the request.
+# The function runs gh attestation verify offline with the identity, the trusted root, and the
+# bundle. The identity uses the policy configuration or a policy program entry. For a program,
+# signer_digest comes from the manifest entry. Every verified statement must have a subject with
+# the requested asset name and SHA-256. The archive SHA-256 must match the request SHA-256.
 sub verify_attestation {
-    my ($policy, $request, $archive_path, $bundle_path) = @_;
+    my ($identity, $request, $archive_path, $bundle_path) = @_;
 
-    my $configuration = $policy->{configuration};
     die "the trusted root $TRUSTED_ROOT_FILE does not exist\n" if !-e $TRUSTED_ROOT_FILE;
     $check_root_owned->($TRUSTED_ROOT_FILE);
 
-    $ensure_target_dir->($policy->{target});
-    my $work_dir = $target_dir->($policy->{target}) . '/work-' . $random_hex->();
+    $ensure_target_dir->($identity->{target});
+    my $work_dir = $target_dir->($identity->{target}) . '/work-' . $random_hex->();
     mkdir($work_dir, $STATE_DIR_MODE) or die "cannot create $work_dir: $!\n";
 
     # gh accepts a bundle only in a file that ends in .json or .jsonl.
@@ -751,13 +859,13 @@ sub verify_attestation {
     my @arguments = (
         'attestation', 'verify', $archive_path,
         '--hostname', $GH_HOST,
-        '--repo', $configuration->{repository},
-        '--cert-identity', $configuration->{workflow_uri},
+        '--repo', $identity->{repository},
+        '--cert-identity', $identity->{workflow_uri},
         '--source-digest', $request->{source_revision},
-        '--source-ref', $configuration->{source_ref},
+        '--source-ref', $identity->{source_ref},
     );
-    push @arguments, '--signer-digest', $configuration->{signer_digest}
-        if defined($configuration->{signer_digest});
+    push @arguments, '--signer-digest', $identity->{signer_digest}
+        if defined($identity->{signer_digest});
     push @arguments,
         '--deny-self-hosted-runners',
         '--bundle', $bundle_copy,
@@ -765,7 +873,7 @@ sub verify_attestation {
         '--format', 'json';
 
     my ($status, $stdout, $stderr) = eval {
-        my $bundle = $read_limited->($bundle_path, $configuration->{max_bundle_bytes});
+        my $bundle = $read_limited->($bundle_path, $identity->{max_bundle_bytes});
         sysopen(my $handle, $bundle_copy, O_WRONLY | O_CREAT | O_EXCL, $STATE_FILE_MODE)
             or die "cannot create $bundle_copy: $!\n";
         $write_all->($handle, $bundle, $bundle_copy);
@@ -964,6 +1072,65 @@ my $compare_field = sub {
         if $actual ne $expected;
 };
 
+# The function checks the programs of a manifest against the request and the policy. The
+# manifest and the program stages of the request must list the same programs. Each program
+# gets a file entry with the path, mode, owner, group, member, and SHA-256 of its executable.
+my $check_manifest_programs = sub {
+    my ($policy, $request, $list) = @_;
+
+    my $label = 'the manifest programs';
+    die "$label field is not a JSON array\n" if ref($list) ne 'ARRAY';
+    my $reserved = { %{ $policy->{files} } };
+    for my $field (values %{ $policy->{secret_fields} }) {
+        $reserved->{ $field->{path} } = $field;
+    }
+    my $staged = { map { $_->{name} => 1 } @{ $request->{program_stages} // [] } };
+
+    my $programs = {};
+    for my $index (0 .. $#$list) {
+        my $raw = $list->[$index];
+        my $entry_label = "$label\[$index\]";
+        $check_keys->($raw, $MANIFEST_PROGRAM_KEYS, $entry_label);
+        my $name = $check_string->($raw, 'name', $PROGRAM_NAME_RE, $entry_label);
+        die "the manifest lists the program $name more than once\n" if $programs->{$name};
+        die "the manifest lists the program $name, and the request does not have a stage for"
+            . " it\n"
+            if !$staged->{$name};
+        my $file = $check_entry->({ map { $_ => $raw->{$_} } @$ENTRY_KEYS }, $entry_label);
+        die "the path $file->{path} of the program $name matches a file path or a secret"
+            . " storage path of this target\n"
+            if $reserved->{ $file->{path} };
+        my $allowed = $program_entry->($policy, $name);
+        $compare_field->(
+            "repository of the program $name", $raw->{repository}, $allowed->{repository},
+        );
+        die "the program $name does not match the path, mode, owner, and group in the policy\n"
+            if !$same_entry->($file, $allowed);
+
+        my $member = $check_string->($raw, 'member', qr/[^\0]+/, $entry_label);
+        $file->{member} = $check_member_name->($member);
+        $file->{sha256} = $check_string->($raw, 'member_sha256', $SHA256_RE, $entry_label);
+        @$file{qw(uid gid)} = $account_ids->($file->{owner}, $file->{group});
+        $programs->{$name} = {
+            name => $name,
+            repository => $allowed->{repository},
+            release_tag => $check_string->($raw, 'release_tag', $NAME_RE, $entry_label),
+            asset => $check_string->($raw, 'asset', $NAME_RE, $entry_label),
+            sha256 => $check_string->($raw, 'sha256', $SHA256_RE, $entry_label),
+            source_revision =>
+                $check_string->($raw, 'source_revision', $REVISION_RE, $entry_label),
+            signer_revision =>
+                $check_string->($raw, 'signer_revision', $REVISION_RE, $entry_label),
+            file => $file,
+        };
+    }
+    for my $name (sort keys %$staged) {
+        die "the request has a stage for the program $name, and the manifest does not list it\n"
+            if !$programs->{$name};
+    }
+    return $programs;
+};
+
 # The function validates the manifest against the request, the policy, and the local node.
 # It validates the archive members against the manifest. The function does not write a file.
 sub validate_archive {
@@ -986,11 +1153,12 @@ sub validate_archive {
     my $manifest = eval { $json->decode($manifest_content) };
     die "$MANIFEST_MEMBER is not valid JSON: $@" if $@;
     my $label = 'the manifest';
-    $check_keys->($manifest, $MANIFEST_KEYS, $label);
-    die "the manifest schema_version is not $SCHEMA_VERSION\n"
-        if !defined($manifest->{schema_version})
-        || ref($manifest->{schema_version})
-        || "$manifest->{schema_version}" ne "$SCHEMA_VERSION";
+    my $version = ref($manifest) eq 'HASH' ? $manifest->{schema_version} : undef;
+    my $manifest_keys;
+    $manifest_keys = $MANIFEST_KEYS_BY_SCHEMA->{$version} if defined($version) && !ref($version);
+    $check_keys->($manifest, $manifest_keys // $MANIFEST_KEYS, $label);
+    die "the manifest schema_version is neither $SCHEMA_VERSION nor $PROGRAM_SCHEMA_VERSION\n"
+        if !$manifest_keys;
 
     $compare_field->(
         'repository', $manifest->{repository}, $policy->{configuration}->{repository},
@@ -1063,11 +1231,33 @@ sub validate_archive {
             if $actual->{sha256} ne $expected->{sha256};
     }
 
+    my $program_list = [];
+    $program_list = $manifest->{programs} if "$version" eq "$PROGRAM_SCHEMA_VERSION";
     return {
         manifest_sha256 => Digest::SHA::sha256_hex($manifest_content),
         directories => $directories,
         files => $files,
+        programs => $check_manifest_programs->($policy, $request, $program_list),
     };
+}
+
+# The function scans the complete program archive and requires exactly one regular member with
+# the member name and SHA-256 in the manifest. It adds the archive path and the member size to
+# the file entry of the program.
+sub check_program_archive {
+    my ($program, $archive_path) = @_;
+
+    my $file = $program->{file};
+    my $members = scan_archive($archive_path, sub { return undef });
+    my ($member) = grep { $_->{name} eq $file->{member} } @$members;
+    die "the archive of the program $program->{name} does not contain the member"
+        . " '$file->{member}'\n"
+        if !$member;
+    die "the member '$file->{member}' of the program $program->{name} has SHA-256"
+        . " $member->{sha256}, and the manifest lists $file->{sha256}\n"
+        if $member->{sha256} ne $file->{sha256};
+    $file->{size} = $member->{size};
+    $file->{archive_path} = $archive_path;
 }
 
 # The function returns the live state of the path without following a symbolic link at the
@@ -1388,14 +1578,24 @@ my $plan_directories = sub {
 
 # The function returns the file actions and the installed file records. A file that matches
 # the manifest keeps its earlier write_id. Every changed file gets the UPID of this task as
-# its write_id.
+# its write_id. The function adds each program as a file entry for the executable member in its
+# own archive.
 my $plan_files = sub {
     my ($policy, $validated, $previous_files, $declared, $upid) = @_;
 
+    my $wanted = { %{ $validated->{files} } };
+    for my $program (values %{ $validated->{programs} }) {
+        $wanted->{ $program->{file}->{path} } = $program->{file};
+    }
+    my $listed = { %{ $policy->{files} } };
+    for my $program (values %{ $policy->{programs} }) {
+        $listed->{ $program->{path} } = $program;
+    }
+
     my $files = [];
     my $records = [];
-    for my $path (sort keys %{ $validated->{files} }) {
-        my $desired = $validated->{files}->{$path};
+    for my $path (sort keys %$wanted) {
+        my $desired = $wanted->{$path};
         $check_ancestors->($path, $declared, $policy->{parents});
         my $observation = observe_file($path);
         die "$path exists and is not a regular file\n"
@@ -1423,8 +1623,8 @@ my $plan_files = sub {
     }
 
     for my $path (sort keys %$previous_files) {
-        next if $validated->{files}->{$path};
-        if (!$policy->{files}->{$path}) {
+        next if $wanted->{$path};
+        if (!$listed->{$path}) {
             print "kept $path because the policy does not list it\n";
             next;
         }
@@ -1463,8 +1663,10 @@ my $prepare_files = sub {
         print "prepared the directory $entry->{path}\n";
     }
 
-    my $by_member = {};
-    my $handles = {};
+    # The function reads each program file from its own archive and every other file from
+    # $archive_path.
+    my $by_source = { $archive_path => {} };
+    my $writes = [];
     for my $entry (grep { $_->{action} eq 'replace' } @$files) {
         sysopen(
             my $handle,
@@ -1472,21 +1674,26 @@ my $prepare_files = sub {
             O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW,
             $STATE_FILE_MODE,
         ) or die "cannot create $entry->{temporary}: $!\n";
-        $handles->{ $entry->{member} } = $handle;
-        $by_member->{ $entry->{member} } = $entry;
+        my $write = { entry => $entry, handle => $handle };
+        my $source = $entry->{desired}->{archive_path} // $archive_path;
+        $by_source->{$source}->{ $entry->{member} } = $write;
+        push @$writes, $write;
     }
-    scan_archive(
-        $archive_path,
-        sub {
-            my ($member) = @_;
-            my $entry = $by_member->{ $member->{name} } or return undef;
-            my $handle = $handles->{ $member->{name} };
-            return sub { $write_all->($handle, $_[0], $entry->{temporary}) };
-        },
-    );
-    for my $member (sort keys %$by_member) {
-        my $entry = $by_member->{$member};
-        my $handle = $handles->{$member};
+    for my $source (sort keys %$by_source) {
+        my $by_member = $by_source->{$source};
+        scan_archive(
+            $source,
+            sub {
+                my ($member) = @_;
+                my $write = $by_member->{ $member->{name} } or return undef;
+                return sub {
+                    $write_all->($write->{handle}, $_[0], $write->{entry}->{temporary});
+                };
+            },
+        );
+    }
+    for my $write (@$writes) {
+        my ($entry, $handle) = @$write{qw(entry handle)};
         my $desired = $entry->{desired};
         $handle->sync() or die "cannot sync $entry->{temporary}: $!\n";
         chown($desired->{uid}, $desired->{gid}, $handle)
@@ -1557,6 +1764,15 @@ my $apply_archive = sub {
         ],
         files => $records,
     };
+    my @program_names = sort keys %{ $validated->{programs} };
+    if (@program_names) {
+        $installed->{programs} = [];
+        for my $name (@program_names) {
+            my $program = $validated->{programs}->{$name};
+            push @{ $installed->{programs} },
+                { map { $_ => $program->{$_} } @$INSTALLED_PROGRAM_KEYS };
+        }
+    }
 
     if (!@$files && !@$directories) {
         $write_file_atomic->(
@@ -1571,6 +1787,7 @@ my $apply_archive = sub {
         upid => $upid,
         archive_stage => $request->{archive_stage},
         bundle_stage => $request->{bundle_stage},
+        program_stages => $request->{program_stages},
         directories => $journal_copy->($directories),
         files => $journal_copy->($files),
     };
@@ -1597,17 +1814,88 @@ my $apply_archive = sub {
     return $installed;
 };
 
+# The function validates the program stages in the request and returns the archive and bundle
+# stage records of each program. It rejects repeated programs and repeated stages, including
+# stages in archive-stage and bundle-stage.
+my $check_program_stages = sub {
+    my ($policy, $request, $user) = @_;
+
+    my $target = $policy->{target};
+    my $stages = { map { $_ => 1 } @$request{qw(archive_stage bundle_stage)} };
+    my $records = {};
+    for my $reference (@{ $request->{program_stages} // [] }) {
+        my $name = $program_entry->($policy, $reference->{name})->{name};
+        die "parameter 'program-stages' lists the program $name more than once\n"
+            if $records->{$name};
+        for my $stage (@$reference{qw(archive_stage bundle_stage)}) {
+            die "the request references the stage $stage more than once\n"
+                if $stages->{$stage}++;
+        }
+        $records->{$name} = {
+            archive => check_stage($target, $reference->{archive_stage}, $user, 'program', $name),
+            bundle =>
+                check_stage($target, $reference->{bundle_stage}, $user, 'program-bundle', $name),
+        };
+    }
+    return $records;
+};
+
+# The function verifies each complete program archive offline with the signer revision of its
+# manifest entry, and then checks the executable member. It does not write a target file.
+my $verify_programs = sub {
+    my ($policy, $validated, $stages) = @_;
+
+    for my $name (sort keys %{ $validated->{programs} }) {
+        my $program = $validated->{programs}->{$name};
+        my $archive_path = $stages->{$name}->{archive}->{data_path};
+        verify_attestation(
+            { %{ $policy->{programs}->{$name} }, signer_digest => $program->{signer_revision} },
+            $program,
+            $archive_path,
+            $stages->{$name}->{bundle}->{data_path},
+        );
+        print "gh attestation verify accepted $program->{asset} with SHA-256"
+            . " $program->{sha256}\n";
+        check_program_archive($program, $archive_path);
+    }
+};
+
 # The function restores an incomplete journal, validates an archive that verify_attestation
-# accepted, and installs its files. The caller acquires the target lock before calling it.
+# accepted, verifies each program archive, and installs the files and programs. It deletes the
+# program stages after a successful install. The caller acquires the target lock before calling
+# it.
 sub install_verified_archive {
     my ($policy, $request, $archive_path, $upid, $user) = @_;
 
     check_node($policy);
     $ensure_target_dir->($policy->{target});
     recover($policy->{target});
+    my $stages = $check_program_stages->($policy, $request, $user);
     my $validated = validate_archive($policy, $request, $archive_path);
-    return $apply_archive->($policy, $request, $archive_path, $validated, $upid, $user);
+    $verify_programs->($policy, $validated, $stages);
+    my $installed = $apply_archive->($policy, $request, $archive_path, $validated, $upid, $user);
+    for my $name (sort keys %$stages) {
+        $remove_stage->($stages->{$name}->{archive});
+        $remove_stage->($stages->{$name}->{bundle});
+    }
+    return $installed;
 }
+
+my $parse_program_stages = sub {
+    my ($value) = @_;
+
+    return [] if !defined($value);
+    my @entries = split(m/,/, $value, -1);
+    die "parameter 'program-stages' is empty\n" if !@entries;
+    my $references = [];
+    for my $entry (@entries) {
+        die "entry '$entry' of parameter 'program-stages' does not match the form"
+            . " `<name>=<archive-stage>:<bundle-stage>`\n"
+            if $entry !~ m/\A($PROGRAM_NAME_RE)=($STAGE_RE):($STAGE_RE)\z/;
+        push @$references, { name => $1, archive_stage => $2, bundle_stage => $3 };
+    }
+    return $references;
+};
 
 # The function checks the install parameters before the API starts a worker.
 sub check_install_request {
@@ -1615,7 +1903,6 @@ sub check_install_request {
 
     my $policy = load_policy($target);
     check_node($policy);
-    die "the trusted root $TRUSTED_ROOT_FILE does not exist\n" if !-e $TRUSTED_ROOT_FILE;
     my $request = {
         release_tag => $untaint->($param->{'release-tag'}, $NAME_RE, 'release-tag'),
         asset => $untaint->($param->{asset}, $NAME_RE, 'asset'),
@@ -1624,14 +1911,18 @@ sub check_install_request {
             $untaint->($param->{'source-revision'}, $REVISION_RE, 'source-revision'),
         archive_stage => $untaint->($param->{'archive-stage'}, $STAGE_RE, 'archive-stage'),
         bundle_stage => $untaint->($param->{'bundle-stage'}, $STAGE_RE, 'bundle-stage'),
+        program_stages => $parse_program_stages->($param->{'program-stages'}),
     };
     check_stage($policy->{target}, $request->{archive_stage}, $user, 'archive');
     check_stage($policy->{target}, $request->{bundle_stage}, $user, 'bundle');
+    $check_program_stages->($policy, $request, $user);
     return $request;
 }
 
-# The function runs one install in a task worker. The worker verifies the staged archive with
-# gh, validates and installs it, and deletes the two stages.
+# The function runs one install in a task worker. The worker first restores an incomplete
+# journal without running gh or using the network. It then verifies the staged archive with gh,
+# verifies each program archive, installs the files and programs, and deletes the request stages
+# after a successful install.
 sub install {
     my ($target, $request, $upid, $user) = @_;
 
@@ -1640,18 +1931,24 @@ sub install {
     return with_target_lock(
         $policy->{target},
         sub {
+            $ensure_target_dir->($policy->{target});
+            recover($policy->{target});
             my $archive =
                 check_stage($policy->{target}, $request->{archive_stage}, $user, 'archive');
             my $bundle =
                 check_stage($policy->{target}, $request->{bundle_stage}, $user, 'bundle');
-            verify_attestation($policy, $request, $archive->{data_path}, $bundle->{data_path});
+            $check_program_stages->($policy, $request, $user);
+            verify_attestation(
+                $policy->{configuration}, $request, $archive->{data_path}, $bundle->{data_path},
+            );
             print "gh attestation verify accepted $request->{asset} with SHA-256"
                 . " $request->{sha256}\n";
             my $installed = install_verified_archive(
                 $policy, $request, $archive->{data_path}, $upid, $user,
             );
-            $remove_stage->($archive);
-            $remove_stage->($bundle);
+            for my $record ($archive, $bundle) {
+                $remove_stage->($record);
+            }
             return $installed;
         },
     );
@@ -1993,6 +2290,7 @@ sub read_state {
 
     my $installed_fields = undef;
     $installed_fields = { map { $_ => $installed->{$_} } @$INSTALLED_KEYS } if $installed;
+    $installed_fields->{programs} = $installed->{programs} if $installed && $installed->{programs};
     return {
         workspace => $policy->{workspace},
         node => $policy->{node},
