@@ -894,9 +894,9 @@ $check->(
 my $task_upid = $install_response->{data};
 my ($task_status) = HostArtifactsTest::wait_for_task($task_upid);
 $check_match->(
-    'the task fails when gh rejects the bundle',
+    'the task fails when gh exits with code 1',
     $task_status,
-    qr/gh attestation verify exited with code [1-9]/,
+    qr/gh attestation verify exited with code 1:/,
 );
 $check_match->('the task records the request user', $task_upid, qr/:deploy\@pve!install:\z/);
 $check->(
@@ -1578,9 +1578,9 @@ my $program_task = $program_install->($valid_program_stages);
 $check->('a valid program request starts a task', $program_task->{status} == 200);
 my ($program_task_status) = HostArtifactsTest::wait_for_task($program_task->{data});
 $check_match->(
-    'a program request task fails when gh rejects the configuration bundle',
+    'a program request task fails when gh exits with code 1',
     $program_task_status,
-    qr/gh attestation verify exited with code [1-9]/,
+    qr/gh attestation verify exited with code 1:/,
 );
 $check->(
     'the failed program task does not write an installed record or a journal',

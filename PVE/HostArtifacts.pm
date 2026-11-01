@@ -1903,7 +1903,6 @@ sub check_install_request {
 
     my $policy = load_policy($target);
     check_node($policy);
-    die "the trusted root $TRUSTED_ROOT_FILE does not exist\n" if !-e $TRUSTED_ROOT_FILE;
     my $request = {
         release_tag => $untaint->($param->{'release-tag'}, $NAME_RE, 'release-tag'),
         asset => $untaint->($param->{asset}, $NAME_RE, 'asset'),

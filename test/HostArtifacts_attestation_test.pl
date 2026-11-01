@@ -46,6 +46,8 @@ my $INTERRUPT_FILE_COUNT = 300;
 my $INTERRUPT_ATTEMPTS = 5;
 my $INTERRUPT_TIMEOUT_SECONDS = 120;
 my $POLL_SECONDS = 0.0005;
+my $NETWORK_DEVICE_DIR = '/sys/class/net';
+my $DEVICE_UP_FLAG = 0x1;
 my $GH_REJECTS = qr/gh attestation verify exited with code [1-9]/;
 my $WANCONFIG_ASSET = 'wanconfig-stack_linux_amd64.tar.gz';
 my $WANCONFIG_SHA256 = '60bf467c9601f612785e2d6fb6f973258fd94af05311e89df87deacf72e1b0c8';
@@ -87,9 +89,21 @@ my $check_error = \&HostArtifactsTest::check_error;
 my $check_match = \&HostArtifactsTest::check_match;
 my $json = HostArtifactsTest::json();
 
-# The rollback and the new install count as offline evidence only when the test process does
-# not have routes on devices other than loopback.
+# The rollback and the new install count as offline evidence only when every device other than
+# lo is down and does not have a route.
 sub require_no_network {
+    my @active;
+    for my $device (@{ directory_names($NETWORK_DEVICE_DIR) }) {
+        my $flags_path = "$NETWORK_DEVICE_DIR/$device/flags";
+        next if $device eq 'lo' || !-e $flags_path;
+        my $flags = HostArtifactsTest::read_file($flags_path);
+        chomp($flags);
+        push @active, $device if hex($flags) & $DEVICE_UP_FLAG;
+    }
+    die "this test needs a container without network access, and these devices are up:"
+        . " @active\n"
+        if @active;
+
     my @routes = split(m/\n/, HostArtifactsTest::read_file('/proc/net/route'));
     shift @routes;
     my @devices = map { (split(' ', $_))[0] } @routes;
@@ -795,6 +809,7 @@ check_unrelated('the install of both programs');
 my $second_archive = configuration_archive('programs-two', 'two');
 my $interrupted_stages;
 my $before_interrupt;
+my $first_program_sha256;
 my $interrupted = 0;
 for my $attempt (1 .. $INTERRUPT_ATTEMPTS) {
     write_previous_programs();
@@ -802,6 +817,7 @@ for my $attempt (1 .. $INTERRUPT_ATTEMPTS) {
         HostArtifactsTest::write_file($path, "one $path\n");
     }
     $before_interrupt = program_state();
+    $first_program_sha256 = Digest::SHA->new(256)->addfile($program_paths->[0])->hexdigest();
     $interrupted_stages = stage_programs();
     stop_during_replacement($second_archive, $interrupted_stages);
     my $phase = '';
@@ -819,7 +835,10 @@ for my $attempt (1 .. $INTERRUPT_ATTEMPTS) {
     );
 }
 $check->('the kill stopped the install during replacement', $interrupted);
-$check->('the stopped install changed a target file', program_state() ne $before_interrupt);
+$check->(
+    'the stopped install replaced the first program file before the kill',
+    Digest::SHA->new(256)->addfile($program_paths->[0])->hexdigest() ne $first_program_sha256,
+);
 $check->(
     'the journal lists the program stages of the stopped install',
     $json->encode($json->decode(HostArtifactsTest::read_file($journal_path))->{program_stages})
