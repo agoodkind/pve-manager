@@ -236,6 +236,42 @@ sub count_with_prefix {
         @$paths);
 }
 
+sub program_entry {
+    my ($name, %override) = @_;
+
+    return {
+        name => $name,
+        repository => 'agoodkind/example',
+        workflow_uri => 'https://github.com/agoodkind/example/.github/workflows/release.yml'
+            . '@refs/heads/main',
+        source_ref => 'refs/heads/main',
+        path => "$ROOT/programs/$name",
+        mode => '0755',
+        owner => 'root',
+        group => 'root',
+        max_archive_bytes => 100,
+        max_bundle_bytes => 50,
+        %override,
+    };
+}
+
+sub program_stage_request {
+    my ($user, $target, $kind, $program, $content) = @_;
+
+    my $params = { kind => $kind, offset => 0, data => encode_base64($content, '') };
+    $params->{program} = $program if defined($program);
+    return HostArtifactsTest::api_request($rpcenv, $user, 'POST', "$target/stage", $params);
+}
+
+sub stage_program {
+    my ($user, $target, $kind, $program, $content) = @_;
+
+    my $response = program_stage_request($user, $target, $kind, $program, $content);
+    die "staging failed with status $response->{status}: " . ($response->{message} // '') . "\n"
+        if $response->{status} != 200;
+    return $response->{data}->{stage};
+}
+
 # Workspace selectors and target identity.
 
 for my $selector (
@@ -937,18 +973,37 @@ $check_unrelated->('the interrupted install and its recovery');
 
 # Stage expiry deletes an old stage and keeps an old stage that the journal lists.
 
+$many_document->{programs} = [program_entry('tool')];
+HostArtifactsTest::write_policy($many_document);
 my $unlisted_stage =
     HostArtifactsTest::stage_file($rpcenv, $TOKEN, $many_target, 'bundle', "old bundle\n");
 my $listed_stage =
     HostArtifactsTest::stage_file($rpcenv, $TOKEN, $many_target, 'archive', "old archive\n");
-for my $stage ($unlisted_stage, $listed_stage) {
+my $unlisted_program_stage = stage_program($TOKEN, $many_target, 'program', 'tool', "old\n");
+my $listed_program_stage = stage_program($TOKEN, $many_target, 'program', 'tool', "kept\n");
+my $listed_program_bundle =
+    stage_program($TOKEN, $many_target, 'program-bundle', 'tool', "kept\n");
+for my $stage (
+    $unlisted_stage, $listed_stage, $unlisted_program_stage, $listed_program_stage,
+    $listed_program_bundle,
+) {
     my $record_path = stage_record_path($many_target, $stage);
     my $record = $json->decode(HostArtifactsTest::read_file($record_path));
     $record->{created} -= $OLD_STAGE_SECONDS;
     HostArtifactsTest::write_file($record_path, $json->encode($record), 0600);
 }
 interrupt_install(
-    $many_policy, $many_archive_two, \@many_paths, archive_stage => $listed_stage,
+    $many_policy,
+    $many_archive_two,
+    \@many_paths,
+    archive_stage => $listed_stage,
+    program_stages => [
+        {
+            name => 'tool',
+            archive_stage => $listed_program_stage,
+            bundle_stage => $listed_program_bundle,
+        },
+    ],
 );
 $check->('the second interruption left a journal', -e $many_journal);
 my $new_stage =
@@ -962,6 +1017,16 @@ $check->(
     -e stage_record_path($many_target, $listed_stage),
 );
 $check->('a stage call keeps a new stage', -e stage_record_path($many_target, $new_stage));
+$check->(
+    'a stage call deletes an old program stage that the journal does not list',
+    !-e stage_record_path($many_target, $unlisted_program_stage),
+);
+$check->(
+    'a stage call keeps the old program stages that the journal lists',
+    -e stage_record_path($many_target, $listed_program_stage)
+        && -e stage_record_path($many_target, $listed_program_bundle),
+);
+$check_unrelated->('stage expiry runs');
 
 # The next install restores the interrupted transaction, then commits.
 my $resumed_upid = install_archive($many_policy, $many_archive_two);
@@ -1194,6 +1259,343 @@ $check_match->(
     $stage_chunk->('bundle', 0, 'b' x 51)->{message},
     qr/bundle is larger than 50 bytes/,
 );
+
+# The tests check validation of program entries in a policy.
+
+my $reserved_dir = "$ROOT/programs/reserved";
+my $reserved_file = "$ROOT/programs/reserved.conf";
+my $reserved_secret = "$ROOT/programs/reserved.env";
+my $program_policy_document = HostArtifactsTest::base_policy(
+    'suburban/program-policy',
+    file_entries([$reserved_file]),
+    [{ path => $reserved_dir, mode => '0755', owner => 'root', group => 'root' }],
+);
+$program_policy_document->{secret_fields} = [
+    {
+        name => 'PROGRAM_TOKEN',
+        storage_path => $reserved_secret,
+        mode => '0600',
+        owner => 'root',
+        group => 'root',
+        pattern => '[a-z]+',
+        min_length => 1,
+        max_length => 64,
+        consumer_units => [],
+    },
+];
+my $without_repository = program_entry('tool');
+delete $without_repository->{repository};
+my $program_policy_cases = [
+    ['a program has an unknown field', [program_entry('tool', extra => 1)], qr/unknown field/],
+    ['a program lacks a repository', [$without_repository], qr/'repository' is missing/],
+    ['a program name is invalid', [program_entry('Tool')], qr/field 'name'/],
+    [
+        'a program repository is invalid',
+        [program_entry('tool', repository => 'no-owner')],
+        qr/field 'repository'/,
+    ],
+    [
+        'a program path is relative',
+        [program_entry('tool', path => 'usr/bin/tool')],
+        qr/must be an absolute path/,
+    ],
+    ['a program mode is invalid', [program_entry('tool', mode => '755')], qr/field 'mode'/],
+    ['a program owner is invalid', [program_entry('tool', owner => 'Root')], qr/field 'owner'/],
+    ['a program group is invalid', [program_entry('tool', group => 'Root')], qr/field 'group'/],
+    [
+        'a program archive limit is zero',
+        [program_entry('tool', max_archive_bytes => 0)],
+        qr/'max_archive_bytes' is not a positive integer/,
+    ],
+    [
+        'a program bundle limit is zero',
+        [program_entry('tool', max_bundle_bytes => 0)],
+        qr/'max_bundle_bytes' is not a positive integer/,
+    ],
+    [
+        'a program name appears more than once',
+        [program_entry('tool'), program_entry('tool', path => "$ROOT/programs/other")],
+        qr/lists the program tool more than once/,
+    ],
+    [
+        'a program path appears more than once',
+        [program_entry('tool'), program_entry('helper', path => "$ROOT/programs/tool")],
+        qr/lists the path .* more than once/,
+    ],
+    [
+        'a program path equals a policy file',
+        [program_entry('tool', path => $reserved_file)],
+        qr/is also a policy file/,
+    ],
+    [
+        'a program path equals a policy directory',
+        [program_entry('tool', path => $reserved_dir)],
+        qr/is also a policy file/,
+    ],
+    [
+        'a program path equals a secret storage path',
+        [program_entry('tool', path => $reserved_secret)],
+        qr/is also a policy file/,
+    ],
+];
+for my $case (@$program_policy_cases) {
+    my ($label, $programs, $pattern) = @$case;
+    my $case_target =
+        HostArtifactsTest::write_policy({ %$program_policy_document, programs => $programs });
+    $check_error->(
+        "policy loading rejects a policy when $label",
+        sub { PVE::HostArtifacts::load_policy($case_target) },
+        $pattern,
+    );
+}
+
+# The tests check program stages and the program-stages install parameter.
+
+my $program_document = HostArtifactsTest::base_policy('suburban/program', []);
+$program_document->{programs} = [program_entry('tool'), program_entry('helper')];
+my $program_target = HostArtifactsTest::write_policy($program_document);
+my $other_program_document = HostArtifactsTest::base_policy('suburban/program-other', []);
+$other_program_document->{programs} = [program_entry('tool')];
+my $other_program_target = HostArtifactsTest::write_policy($other_program_document);
+
+$check_match->(
+    'a program stage requires the program parameter',
+    program_stage_request($TOKEN, $program_target, 'program', undef, 'a')->{message},
+    qr/the kind program requires parameter 'program'/,
+);
+$check_match->(
+    'a program-bundle stage requires the program parameter',
+    program_stage_request($TOKEN, $program_target, 'program-bundle', undef, 'a')->{message},
+    qr/the kind program-bundle requires parameter 'program'/,
+);
+for my $kind ('archive', 'bundle') {
+    $check_match->(
+        "a stage of kind $kind rejects the program parameter",
+        program_stage_request($TOKEN, $program_target, $kind, 'tool', 'a')->{message},
+        qr/the kind $kind rejects parameter 'program'/,
+    );
+}
+$check_match->(
+    'staging rejects a program outside the selected policy',
+    program_stage_request($TOKEN, $program_target, 'program', 'missing', 'a')->{message},
+    qr/does not list the program missing/,
+);
+$check_match->(
+    'staging rejects a program that only another target policy lists',
+    program_stage_request($TOKEN, $other_program_target, 'program', 'helper', 'a')->{message},
+    qr/does not list the program helper/,
+);
+$check_unrelated->('staging rejects invalid program requests');
+
+$check->(
+    'a program stage at the size limit in its policy entry succeeds',
+    program_stage_request($TOKEN, $program_target, 'program', 'tool', 'a' x 100)->{status} == 200,
+);
+$check_match->(
+    'a program chunk above the size limit in its policy entry fails',
+    program_stage_request($TOKEN, $program_target, 'program', 'tool', 'a' x 101)->{message},
+    qr/program is larger than 100 bytes/,
+);
+my $partial_program = stage_program($TOKEN, $program_target, 'program', 'tool', 'a' x 60);
+my $program_chunk = sub {
+    my ($program) = @_;
+
+    return HostArtifactsTest::api_request(
+        $rpcenv, $TOKEN, 'POST', "$program_target/stage",
+        {
+            kind => 'program',
+            offset => 60,
+            data => encode_base64('a' x 41, ''),
+            stage => $partial_program,
+            program => $program,
+        },
+    );
+};
+$check_match->(
+    'a later chunk that would exceed the program stage size limit fails',
+    $program_chunk->('tool')->{message},
+    qr/program is larger than 100 bytes/,
+);
+$check_match->(
+    'a later chunk for another program fails',
+    $program_chunk->('helper')->{message},
+    qr/belongs to another program/,
+);
+$check->(
+    'a program-bundle stage at the size limit in its policy entry succeeds',
+    program_stage_request($TOKEN, $program_target, 'program-bundle', 'tool', 'b' x 50)->{status}
+        == 200,
+);
+$check_match->(
+    'a program-bundle chunk above the size limit in its policy entry fails',
+    program_stage_request($TOKEN, $program_target, 'program-bundle', 'tool', 'b' x 51)->{message},
+    qr/program-bundle is larger than 50 bytes/,
+);
+$check->(
+    'an archive stage uses the size limit in the policy configuration',
+    program_stage_request($TOKEN, $program_target, 'archive', undef, 'a' x 101)->{status} == 200,
+);
+$check_unrelated->('staging enforces the program stage size limits');
+
+my $tool_archive = stage_program($TOKEN, $program_target, 'program', 'tool', 'tool');
+my $tool_bundle = stage_program($TOKEN, $program_target, 'program-bundle', 'tool', 'bundle');
+my $helper_archive = stage_program($TOKEN, $program_target, 'program', 'helper', 'helper');
+my $helper_bundle = stage_program($TOKEN, $program_target, 'program-bundle', 'helper', 'bundle');
+my $tool_record =
+    $json->decode(HostArtifactsTest::read_file(stage_record_path($program_target, $tool_archive)));
+$check->(
+    'a program stage records the target, actor, kind, and program',
+    $tool_record->{target} eq $program_target
+        && $tool_record->{user} eq $TOKEN
+        && $tool_record->{kind} eq 'program'
+        && $tool_record->{program} eq 'tool',
+);
+
+my $config_archive =
+    HostArtifactsTest::stage_file($rpcenv, $TOKEN, $program_target, 'archive', 'archive');
+my $config_bundle =
+    HostArtifactsTest::stage_file($rpcenv, $TOKEN, $program_target, 'bundle', 'bundle');
+my $spare_archive =
+    HostArtifactsTest::stage_file($rpcenv, $TOKEN, $program_target, 'archive', 'spare');
+my $other_archive = stage_program($TOKEN, $other_program_target, 'program', 'tool', 'other');
+my $other_bundle = stage_program($TOKEN, $other_program_target, 'program-bundle', 'tool', 'other');
+my $actor_archive = stage_program('deploy@pve', $program_target, 'program', 'tool', 'actor');
+my $actor_bundle = stage_program('deploy@pve', $program_target, 'program-bundle', 'tool', 'actor');
+
+my $program_params = sub {
+    my ($program_stages) = @_;
+
+    return {
+        %$install_params_without_stages,
+        'archive-stage' => $config_archive,
+        'bundle-stage' => $config_bundle,
+        'program-stages' => $program_stages,
+    };
+};
+my $program_install = sub {
+    my ($program_stages) = @_;
+
+    return HostArtifactsTest::api_request(
+        $rpcenv, $TOKEN, 'POST', $program_target, $program_params->($program_stages),
+    );
+};
+my $check_program_request = sub {
+    my ($label, $program_stages, $pattern) = @_;
+
+    my $response = $program_install->($program_stages);
+    $check->("the request does not start a task when $label", $response->{status} != 200);
+    $check_match->(
+        "the request fails with the expected error when $label",
+        $response->{message},
+        $pattern,
+    );
+    $check_unrelated->($label);
+};
+
+$check->(
+    'a program-stages value in the wrong form does not start a task',
+    $program_install->('tool')->{status} == 400,
+);
+$check_program_request->(
+    'the program is unknown', "missing=$tool_archive:$tool_bundle",
+    qr/does not list the program missing/,
+);
+$check_program_request->(
+    'a stage belongs to another target', "tool=$other_archive:$other_bundle",
+    qr/stage \Q$other_archive\E does not exist for this target/,
+);
+$check_program_request->(
+    'a stage belongs to another actor', "tool=$actor_archive:$actor_bundle",
+    qr/stage \Q$actor_archive\E belongs to another user/,
+);
+$check_program_request->(
+    'the request swaps program stages', "tool=$tool_bundle:$tool_archive",
+    qr/has the kind program-bundle, not program/,
+);
+$check_program_request->(
+    'the request uses an archive stage in place of a program stage',
+    "tool=$spare_archive:$tool_bundle",
+    qr/has the kind archive, not program/,
+);
+$check_program_request->(
+    'a stage belongs to another program', "helper=$tool_archive:$tool_bundle",
+    qr/stage \Q$tool_archive\E belongs to another program/,
+);
+$check_program_request->(
+    'the request repeats a program',
+    "tool=$tool_archive:$tool_bundle,tool=$tool_archive:$tool_bundle",
+    qr/lists the program tool more than once/,
+);
+$check_program_request->(
+    'the request repeats a stage',
+    "tool=$tool_archive:$tool_bundle,helper=$tool_archive:$helper_bundle",
+    qr/references the stage \Q$tool_archive\E more than once/,
+);
+$check_program_request->(
+    'the request also uses the configuration archive stage as a program stage',
+    "tool=$config_archive:$tool_bundle",
+    qr/references the stage \Q$config_archive\E more than once/,
+);
+
+# The tests copy stages from another target into the selected target. Each copied stage record
+# retains the original target.
+my @copied_stage_paths;
+for my $stage ($other_archive, $other_bundle) {
+    for my $suffix ('', '.json') {
+        my $source = "$STATE_DIR/$other_program_target/stages/$stage$suffix";
+        my $copy = "$STATE_DIR/$program_target/stages/$stage$suffix";
+        HostArtifactsTest::write_file($copy, HostArtifactsTest::read_file($source), 0600);
+        push @copied_stage_paths, $copy;
+    }
+}
+$check_program_request->(
+    'a copied stage records another target', "tool=$other_archive:$other_bundle",
+    qr/the stage record .* is not valid/,
+);
+for my $path (@copied_stage_paths) {
+    unlink($path) or die "cannot delete $path: $!\n";
+}
+
+my $valid_program_stages =
+    "tool=$tool_archive:$tool_bundle,helper=$helper_archive:$helper_bundle";
+my $checked_request = PVE::HostArtifacts::check_install_request(
+    $program_target, $TOKEN, $program_params->($valid_program_stages),
+);
+$check->(
+    'check_install_request returns the parsed program stage references',
+    $json->encode($checked_request->{program_stages}) eq $json->encode([
+        { name => 'tool', archive_stage => $tool_archive, bundle_stage => $tool_bundle },
+        { name => 'helper', archive_stage => $helper_archive, bundle_stage => $helper_bundle },
+    ]),
+);
+my $unreferenced_request = PVE::HostArtifacts::check_install_request(
+    $program_target, $TOKEN, $program_params->(undef),
+);
+$check->(
+    'check_install_request returns an empty program stage list when the request omits'
+        . ' program-stages',
+    !@{ $unreferenced_request->{program_stages} },
+);
+
+my $program_task = $program_install->($valid_program_stages);
+$check->('a valid program request starts a task', $program_task->{status} == 200);
+my ($program_task_status) = HostArtifactsTest::wait_for_task($program_task->{data});
+$check_match->(
+    'a program request task fails with an error that the host cannot install programs',
+    $program_task_status,
+    qr/this host cannot install programs yet/,
+);
+$check->(
+    'the failed program task does not write an installed record or a journal',
+    !-e "$STATE_DIR/$program_target/installed.json"
+        && !-e "$STATE_DIR/$program_target/journal.json",
+);
+$check->(
+    'the failed program task keeps the program stages',
+    !grep { !-e stage_record_path($program_target, $_) }
+        ($tool_archive, $tool_bundle, $helper_archive, $helper_bundle),
+);
+$check_unrelated->('the program task fails');
 
 # The tests check installs of one target under the target lock.
 

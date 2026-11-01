@@ -18,6 +18,8 @@ use base qw(PVE::RESTHandler);
 my $CHUNK_BASE64_MAX_LENGTH = 128 * 1024;
 my $NAME_MAX_LENGTH = 255;
 my $SECRET_VALUE_MAX_LENGTH = 512;
+my $PROGRAM_NAME_PATTERN = '[a-z][a-z0-9-]*';
+my $PROGRAM_STAGE_PATTERN = "$PROGRAM_NAME_PATTERN=[0-9a-f]{32}:[0-9a-f]{32}";
 
 my $target_property = {
     type => 'string',
@@ -147,8 +149,16 @@ __PACKAGE__->register_method({
             target => $target_property,
             kind => {
                 type => 'string',
-                enum => ['archive', 'bundle'],
+                enum => ['archive', 'bundle', 'program', 'program-bundle'],
                 description => 'The value identifies the content of the stage.',
+            },
+            program => {
+                type => 'string',
+                pattern => $PROGRAM_NAME_PATTERN,
+                optional => 1,
+                description => 'The value is the name of a program in the target policy. The'
+                    . ' kinds program and program-bundle require it. The kinds archive and'
+                    . ' bundle reject it.',
             },
             offset => {
                 type => 'integer',
@@ -184,6 +194,7 @@ __PACKAGE__->register_method({
             $param->{offset},
             $param->{data},
             $param->{stage},
+            $param->{program},
         );
     },
 });
@@ -219,6 +230,13 @@ __PACKAGE__->register_method({
             },
             'archive-stage' => $stage_property,
             'bundle-stage' => $stage_property,
+            'program-stages' => {
+                type => 'string',
+                pattern => "$PROGRAM_STAGE_PATTERN(?:,$PROGRAM_STAGE_PATTERN)*",
+                optional => 1,
+                description => 'The value lists the stages for each program as'
+                    . ' `<name>=<archive-stage>:<bundle-stage>` entries separated by commas.',
+            },
         },
     },
     returns => {
