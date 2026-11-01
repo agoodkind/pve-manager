@@ -401,6 +401,11 @@ __PACKAGE__->register_method({
                             description => 'The value is true when the storage file is a regular'
                                 . ' file with the mode, owner, and group of the policy.',
                         },
+                        restart_pending => {
+                            type => 'boolean',
+                            description => 'The value is true when the secret record lists a'
+                                . ' consumer restart for a unit that the policy lists.',
+                        },
                         version => {
                             type => 'integer',
                             optional => 1,

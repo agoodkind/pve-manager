@@ -1708,6 +1708,11 @@ my $secret_states = sub {
         $state->{sha256} = $observation->{sha256} if defined($observation->{sha256});
         my $record = $secrets->{fields}->{$name};
         $state->{version} = $record->{version} if $record;
+        # A recorded restart counts only for a unit that the policy still lists.
+        my $listed_units = { map { $_ => 1 } @{ $descriptor->{consumer_units} } };
+        my $recorded_units = $record ? $record->{pending} // [] : [];
+        my @pending_units = grep { $listed_units->{$_} } @$recorded_units;
+        $state->{restart_pending} = @pending_units ? 1 : 0;
         push @$states, $state;
     }
     return $states;

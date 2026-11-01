@@ -43,6 +43,7 @@ my $OTHER_FIELD = 'OTHER_API_KEY';
 my $CONSUMER = 'hostsecret-consumer.service';
 my $OTHER_CONSUMER = 'hostsecret-other.service';
 my $UNRELATED = 'hostsecret-unrelated.service';
+my $OTHER_POLICY_UNIT = 'hostsecret-other-policy.service';
 my $SECRET_TOKEN = 'deploy@pve!rotate';
 my $WAIT_SECONDS = 120;
 
@@ -306,9 +307,10 @@ $check->(
 );
 my $state = secret_state($target, $FIELD);
 $check->(
-    'GET reports only the field, configured, version, and SHA-256',
-    join(',', sort keys %$state) eq 'configured,field,sha256,version',
+    'GET reports only the field, configured, restart_pending, version, and SHA-256',
+    join(',', sort keys %$state) eq 'configured,field,restart_pending,sha256,version',
 );
+$check->('GET reports restart_pending 0 after version 1', $state->{restart_pending} eq '0');
 $check->(
     'GET reports version 1 and the SHA-256 of the storage file',
     $state->{configured}
@@ -492,6 +494,33 @@ $check->(
     'the record keeps the restart of the consumer',
     join(',', @{ secret_record($target, $FIELD)->{pending} }) eq $CONSUMER,
 );
+$check->(
+    'GET reports restart_pending 1 after the failed restart',
+    secret_state($target, $FIELD)->{restart_pending} eq '1',
+);
+
+# The function returns the storage file and secret record state of the selected target.
+sub secret_files_state {
+    return join(' ', file_state($secret_file), file_state("$STATE_DIR/$target/secrets.json"));
+}
+
+my $files_before_get = secret_files_state();
+my $audit_response =
+    HostArtifactsTest::api_request($rpcenv, 'deploy@pve!audit', 'GET', $target, {});
+my ($audit_state) = grep { $_->{field} eq $FIELD } @{ $audit_response->{data}->{secrets} // [] };
+$check->(
+    'GET reports restart_pending 1 for an audit-only token',
+    $audit_response->{status} == 200 && $audit_state->{restart_pending} eq '1',
+);
+my $audit_text = $json->encode($audit_response->{data});
+$check->(
+    'the audit response does not contain the value or a unit name',
+    index($audit_text, $MARKER) < 0 && index($audit_text, $CONSUMER) < 0,
+);
+$check->(
+    'GET does not change the storage file or the secret record while a restart is pending',
+    secret_files_state() eq $files_before_get,
+);
 unlink("$ROOT/state/fail") or die "cannot delete $ROOT/state/fail: $!\n";
 chmod(0644, $secret_file) or die "cannot change $secret_file: $!\n";
 $consumer_before = unit_property($CONSUMER, 'InvocationID');
@@ -508,6 +537,10 @@ $check->(
 );
 $check->('the consumer receives version 3', received() eq received_value('three'));
 $check->('the retry clears the restart', !@{ secret_record($target, $FIELD)->{pending} });
+$check->(
+    'GET reports restart_pending 0 after the retry of version 3',
+    secret_state($target, $FIELD)->{restart_pending} eq '0',
+);
 $check_unrelated->('the failed restart and its retry');
 
 # The tests check an interrupted task and its recovery.
@@ -533,6 +566,10 @@ sub interrupt_rotation {
         secret_record($target, $FIELD)->{version} == $version
             && join(',', @{ secret_record($target, $FIELD)->{pending} }) eq $CONSUMER,
     );
+    $check->(
+        "GET reports restart_pending 1 after the stopped task of version $version",
+        secret_state($target, $FIELD)->{restart_pending} eq '1',
+    );
     unlink("$ROOT/state/hold") or die "cannot delete $ROOT/state/hold: $!\n";
     wait_for_state($CONSUMER, 'active');
 }
@@ -547,6 +584,10 @@ $check->(
 );
 $check->('the consumer receives version 4', received() eq received_value('four'));
 $check->('the retry clears the restart', !@{ secret_record($target, $FIELD)->{pending} });
+$check->(
+    'GET reports restart_pending 0 after the retry of version 4',
+    secret_state($target, $FIELD)->{restart_pending} eq '0',
+);
 $check_unrelated->('the interrupted task and its recovery');
 
 # The tests check a retry after an operator stops the consumer.
@@ -576,6 +617,37 @@ $check->(
 );
 run_systemctl('start', $CONSUMER);
 $check_unrelated->('the retry after an operator stop');
+
+# The tests check a recorded restart of a unit that the policy does not list anymore.
+
+HostArtifactsTest::write_file("$ROOT/state/fail", '');
+$status = set_secret($target, $FIELD, value('six'), 6);
+$check_match->(
+    'the request for version 6 fails when the consumer restart fails',
+    $status,
+    qr/systemctl restart \Q$CONSUMER\E failed/,
+);
+unlink("$ROOT/state/fail") or die "cannot delete $ROOT/state/fail: $!\n";
+$secret_descriptor->{consumer_units} = [$OTHER_POLICY_UNIT];
+HostArtifactsTest::write_policy($document);
+$check->(
+    'GET reports restart_pending 0 when the policy does not list the recorded unit',
+    secret_state($target, $FIELD)->{restart_pending} eq '0'
+        && join(',', @{ secret_record($target, $FIELD)->{pending} }) eq $CONSUMER,
+);
+$secret_descriptor->{consumer_units} = [$CONSUMER];
+HostArtifactsTest::write_policy($document);
+$check->(
+    'GET reports restart_pending 1 when the policy lists the recorded unit again',
+    secret_state($target, $FIELD)->{restart_pending} eq '1',
+);
+$status = set_secret($target, $FIELD, value('six'), 6);
+$check->('a retry of version 6 succeeds', $status eq 'OK', $status);
+$check->(
+    'GET reports restart_pending 0 after the retry of version 6',
+    secret_state($target, $FIELD)->{restart_pending} eq '0',
+);
+$check_unrelated->('the recorded restart of an unlisted unit');
 
 # The stopped target keeps its journal and uses that journal to restore its files.
 
