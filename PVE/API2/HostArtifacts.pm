@@ -332,7 +332,7 @@ __PACKAGE__->register_method({
 my $unit_property = {
     type => 'string',
     pattern => '[A-Za-z0-9][A-Za-z0-9@._:-]{0,246}\.service',
-    description => 'The value is a unit name. The target policy must list the unit file'
+    description => 'The service unit name. The target policy must list the unit file'
         . ' /etc/systemd/system/<name>.',
 };
 
@@ -345,8 +345,8 @@ __PACKAGE__->register_method({
     permissions => {
         check => ['perm', '/nodes/{node}', ['Sys.HostArtifacts.Audit']],
     },
-    description => 'The method returns the unit file state and the active state of a unit that'
-        . ' the target policy lists. The method does not change a file or a unit.',
+    description => 'Returns the unit file state and active state of a service that the target'
+        . ' policy lists. This method does not change files or units.',
     parameters => {
         additionalProperties => 0,
         properties => {
@@ -358,21 +358,21 @@ __PACKAGE__->register_method({
     returns => {
         type => 'object',
         properties => {
-            name => { type => 'string', description => 'The value is the unit name.' },
+            name => { type => 'string', description => 'The service unit name.' },
             found => {
                 type => 'boolean',
-                description => 'The value is false when the unit file does not exist or systemd'
+                description => 'False when the unit file does not exist or systemd'
                     . ' does not find the unit.',
             },
             unit_file_state => {
                 type => 'string',
                 optional => 1,
-                description => 'The value is the output of systemctl is-enabled.',
+                description => 'The output of systemctl is-enabled.',
             },
             active_state => {
                 type => 'string',
                 optional => 1,
-                description => 'The value is the output of systemctl is-active.',
+                description => 'The output of systemctl is-active.',
             },
         },
     },
@@ -405,14 +405,14 @@ __PACKAGE__->register_method({
             action => {
                 type => 'string',
                 enum => [qw(daemon-reload enable reenable disable start stop restart)],
-                description => 'The value selects the systemctl action. daemon-reload reloads'
+                description => 'The systemctl action. daemon-reload reloads'
                     . ' the systemd manager configuration.',
             },
         },
     },
     returns => {
         type => 'string',
-        description => 'The value is the UPID of the hostunit task.',
+        description => 'The UPID of the hostunit task.',
     },
     code => sub {
         my ($param) = @_;

@@ -2238,11 +2238,8 @@ sub set_secret {
 
 my $UNIT_DIR = '/etc/systemd/system';
 
-# The unit methods accept only these actions. Each action runs systemctl with fixed arguments.
 my $UNIT_ACTIONS = { map { $_ => 1 } qw(daemon-reload enable reenable disable start stop restart) };
 
-# The function returns the unit name and the unit file path. A target owns a unit only when its
-# policy lists the unit file path.
 my $owned_unit = sub {
     my ($policy, $unit) = @_;
 
@@ -2253,8 +2250,6 @@ my $owned_unit = sub {
     return ($name, $path);
 };
 
-# The function requires a committed installed record that lists the unit file and a live unit
-# file that matches the record in content, size, mode, owner, and group.
 my $check_installed_unit = sub {
     my ($policy, $path) = @_;
 
@@ -2270,9 +2265,7 @@ my $check_installed_unit = sub {
         if !$observation_matches->(observe_file($path), $record);
 };
 
-# The function runs a read-only systemctl query and returns the first line of its output.
-# systemctl is-enabled and is-active print the state and exit with a nonzero status for most
-# states.
+# systemctl is-enabled and is-active can print a state and exit with a nonzero status.
 my $query_systemctl = sub {
     my (@arguments) = @_;
 
@@ -2294,9 +2287,6 @@ my $query_systemctl = sub {
     return $line;
 };
 
-# The function returns the unit file state and the active state of a unit that the target owns.
-# found is false when the unit file does not exist or systemd does not find the unit. The
-# function does not change a file or a unit.
 sub read_unit {
     my ($target, $unit) = @_;
 
@@ -2315,8 +2305,6 @@ sub read_unit {
     };
 }
 
-# The function checks a unit action before the API starts a worker and returns the checked
-# target, unit, and action.
 sub check_unit_request {
     my ($target, $unit, $action) = @_;
 
@@ -2333,8 +2321,7 @@ sub check_unit_request {
     };
 }
 
-# The function runs one unit action in a task worker. After it acquires the target lock, it
-# loads the policy and checks the installed unit file again.
+# Recheck the policy and installed unit after acquiring the target lock.
 sub run_unit_action {
     my ($target, $unit, $action) = @_;
 

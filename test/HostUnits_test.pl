@@ -80,7 +80,6 @@ sub unit_entry {
     return { path => unit_path($unit), mode => '0644', owner => 'root', group => 'root' };
 }
 
-# The function installs files for a target with the module entry point.
 sub install_files {
     my ($document, $files, $name) = @_;
 
@@ -118,7 +117,6 @@ sub unit_post {
     );
 }
 
-# The function starts a unit action and returns the task status and the task log.
 sub unit_action {
     my ($target, $unit, $action) = @_;
 
@@ -183,8 +181,6 @@ HostArtifactsTest::write_file(unit_path($UNLISTED_UNIT), unit_content('/bin/true
 run_systemctl('daemon-reload');
 run_systemctl('restart', $UNRELATED_UNIT);
 
-# The tests check the target before it has an installed record.
-
 my $missing = unit_state($target, $UNIT);
 $check->(
     'GET reports found 0 for a listed unit without a unit file',
@@ -221,7 +217,6 @@ my ($interrupted_target, $interrupted_paths) = HostArtifactsTest::interrupted_ta
     { unit_path($INTERRUPTED_UNIT) => unit_content('/bin/true') },
 );
 
-# The function returns the state that every unit request leaves unchanged.
 sub unrelated_state {
     return $json->encode({
         target => HostArtifactsTest::target_state($target, $app_file),
@@ -246,7 +241,6 @@ my $check_unrelated = sub {
     );
 };
 
-# The function returns the state of the test unit that a rejected request leaves unchanged.
 sub test_unit_state {
     return join(
         ' ',
@@ -256,8 +250,6 @@ sub test_unit_state {
         unit_property($UNIT, 'UnitFileState'),
     );
 }
-
-# The tests check callers without the required privileges.
 
 for my $user ('deploy@pve!audit', 'deploy@pve!rotate', 'deploy@pve!none') {
     my $response = unit_post($user, $target, $UNIT, { action => 'start' });
@@ -272,8 +264,6 @@ $check->(
     unit_property($UNIT, 'ActiveState') eq 'inactive',
 );
 $check_unrelated->('the denied requests');
-
-# The tests check the actions on an owned unit.
 
 my ($status) = unit_action($target, $UNIT, 'daemon-reload');
 $check->('daemon-reload succeeds', $status eq 'OK', $status);
@@ -314,8 +304,6 @@ $check->(
 );
 $check_unrelated->('the owned unit actions');
 
-# The tests check rejected requests.
-
 my $unlisted = qr/does not list the unit file/;
 my $start = { action => 'start' };
 my $rejections = [
@@ -351,8 +339,6 @@ $check->(
 );
 $check_unrelated->('the rejected requests');
 
-# The tests check changed unit files.
-
 my $path = unit_path($UNIT);
 for my $change (
     ['content', sub { HostArtifactsTest::write_file($path, "$unit_content# changed\n") }],
@@ -376,8 +362,6 @@ for my $change (
 $check->('a restored unit file permits actions again', $status eq 'OK', $status);
 $check_unrelated->('the changed unit files');
 
-# The tests check an interrupted installation.
-
 my $interrupted_before = unrelated_state();
 my $interrupted =
     unit_post($MODIFY_TOKEN, $interrupted_target, $INTERRUPTED_UNIT, { action => 'start' });
@@ -395,8 +379,6 @@ $check->(
     unrelated_state() eq $interrupted_before,
 );
 
-# The tests check a failed action.
-
 ($status) = unit_action($target, $FAILING_UNIT, 'daemon-reload');
 my ($failed_status, $failed_log) = unit_action($target, $FAILING_UNIT, 'start');
 $check_match->(
@@ -412,16 +394,12 @@ $check_match->(
 expect_state('after the failed start', $target, $FAILING_UNIT, 'disabled', 'failed');
 $check_unrelated->('the failed action');
 
-# The tests check stop and disable.
-
 ($status) = unit_action($target, $UNIT, 'stop');
 $check->('stop succeeds', $status eq 'OK', $status);
 ($status) = unit_action($target, $UNIT, 'disable');
 $check->('disable succeeds', $status eq 'OK', $status);
 expect_state('after stop and disable', $target, $UNIT, 'disabled', 'inactive');
 $check_unrelated->('stop and disable');
-
-# The tests check the cleanup.
 
 PVE::HostArtifacts::with_target_lock(
     $interrupted_target, sub { PVE::HostArtifacts::recover($interrupted_target) },
