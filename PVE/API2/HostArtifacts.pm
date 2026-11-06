@@ -329,6 +329,112 @@ __PACKAGE__->register_method({
     },
 });
 
+my $unit_property = {
+    type => 'string',
+    pattern => '[A-Za-z0-9][A-Za-z0-9@._:-]{0,246}\.service',
+    description => 'The value is a unit name. The target policy must list the unit file'
+        . ' /etc/systemd/system/<name>.',
+};
+
+__PACKAGE__->register_method({
+    name => 'get_host_unit',
+    path => '{target}/units/{name}',
+    method => 'GET',
+    protected => 1,
+    proxyto => 'node',
+    permissions => {
+        check => ['perm', '/nodes/{node}', ['Sys.HostArtifacts.Audit']],
+    },
+    description => 'The method returns the unit file state and the active state of a unit that'
+        . ' the target policy lists. The method does not change a file or a unit.',
+    parameters => {
+        additionalProperties => 0,
+        properties => {
+            node => get_standard_option('pve-node'),
+            target => $target_property,
+            name => $unit_property,
+        },
+    },
+    returns => {
+        type => 'object',
+        properties => {
+            name => { type => 'string', description => 'The value is the unit name.' },
+            found => {
+                type => 'boolean',
+                description => 'The value is false when the unit file does not exist or systemd'
+                    . ' does not find the unit.',
+            },
+            unit_file_state => {
+                type => 'string',
+                optional => 1,
+                description => 'The value is the output of systemctl is-enabled.',
+            },
+            active_state => {
+                type => 'string',
+                optional => 1,
+                description => 'The value is the output of systemctl is-active.',
+            },
+        },
+    },
+    code => sub {
+        my ($param) = @_;
+
+        return PVE::HostArtifacts::read_unit($param->{target}, $param->{name});
+    },
+});
+
+__PACKAGE__->register_method({
+    name => 'run_host_unit_action',
+    path => '{target}/units/{name}',
+    method => 'POST',
+    protected => 1,
+    proxyto => 'node',
+    expose_credentials => 1,
+    permissions => {
+        check => ['perm', '/nodes/{node}', ['Sys.HostArtifacts.Modify']],
+    },
+    description => 'The hostunit task runs one fixed systemctl action for a unit that the target'
+        . ' policy lists. The committed installed record must list the unit file, and the live'
+        . ' unit file must match that record.',
+    parameters => {
+        additionalProperties => 0,
+        properties => {
+            node => get_standard_option('pve-node'),
+            target => $target_property,
+            name => $unit_property,
+            action => {
+                type => 'string',
+                enum => [qw(daemon-reload enable reenable disable start stop restart)],
+                description => 'The value selects the systemctl action. daemon-reload reloads'
+                    . ' the systemd manager configuration.',
+            },
+        },
+    },
+    returns => {
+        type => 'string',
+        description => 'The value is the UPID of the hostunit task.',
+    },
+    code => sub {
+        my ($param) = @_;
+
+        my $user = $request_user->();
+        my $request = PVE::HostArtifacts::check_unit_request(
+            $param->{target}, $param->{name}, $param->{action},
+        );
+
+        return $start_worker->(
+            'hostunit',
+            $request->{target},
+            $user,
+            sub {
+                PVE::HostArtifacts::run_unit_action(
+                    $request->{target}, $request->{unit}, $request->{action},
+                );
+            },
+        );
+    },
+});
+
 __PACKAGE__->register_method({
     name => 'get_host_artifact',
     path => '{target}',

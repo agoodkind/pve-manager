@@ -69,10 +69,14 @@ test-host-artifacts:
 	./ACMEPermissions_test.pl
 	./HostArtifacts_test.pl
 
-# This target also needs systemd as process 1.
+# These targets also need systemd as process 1.
 .PHONY: test-host-secrets
 test-host-secrets:
 	./HostSecrets_test.pl
+
+.PHONY: test-host-units
+test-host-units:
+	./HostUnits_test.pl
 
 .PHONY: test-host-artifacts-attestation
 test-host-artifacts-attestation:

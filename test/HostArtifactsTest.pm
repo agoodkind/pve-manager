@@ -347,19 +347,24 @@ sub target_state {
 # kills the child after the first file appears, and the target keeps its journal. The function
 # returns the target and the file paths.
 sub interrupted_target {
-    my ($workspace, $dir) = @_;
+    my ($workspace, $dir, $extra_files) = @_;
 
     make_path($dir, { mode => 0755 });
     my $paths = [map { sprintf('%s/file-%04d.conf', $dir, $_) } 1 .. $INTERRUPT_FILE_COUNT];
+    my $contents = { map { $_ => { content => "$_\n" } } @$paths };
+    my $policy_paths = [@$paths];
+    for my $path (sort keys %{ $extra_files // {} }) {
+        $contents->{$path} = { content => $extra_files->{$path} };
+        push @$policy_paths, $path;
+    }
     my $document = base_policy(
         $workspace,
-        [map { { path => $_, mode => '0644', owner => 'root', group => 'root' } } @$paths],
+        [map { { path => $_, mode => '0644', owner => 'root', group => 'root' } } @$policy_paths],
     );
     my $target = write_policy($document);
     remove_tree("$STATE_DIR/$target");
     my $policy = PVE::HostArtifacts::load_policy($target);
-    my ($manifest, $members) =
-        artifact($document, { map { $_ => { content => "$_\n" } } @$paths });
+    my ($manifest, $members) = artifact($document, $contents);
     my $archive = "$dir.tar.gz";
     write_archive(
         $archive, [{ name => 'manifest.json', content => $json->encode($manifest) }, @$members],

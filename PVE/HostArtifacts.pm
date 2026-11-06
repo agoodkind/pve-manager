@@ -2236,6 +2236,120 @@ sub set_secret {
     );
 }
 
+my $UNIT_DIR = '/etc/systemd/system';
+
+# The unit methods accept only these actions. Each action runs systemctl with fixed arguments.
+my $UNIT_ACTIONS = { map { $_ => 1 } qw(daemon-reload enable reenable disable start stop restart) };
+
+# The function returns the unit name and the unit file path. A target owns a unit only when its
+# policy lists the unit file path.
+my $owned_unit = sub {
+    my ($policy, $unit) = @_;
+
+    my $name = $untaint->($unit, $UNIT_RE, 'unit');
+    my $path = "$UNIT_DIR/$name";
+    die "the policy of this target does not list the unit file $path\n"
+        if !$policy->{files}->{$path};
+    return ($name, $path);
+};
+
+# The function requires a committed installed record that lists the unit file and a live unit
+# file that matches the record in content, size, mode, owner, and group.
+my $check_installed_unit = sub {
+    my ($policy, $path) = @_;
+
+    my $target = $policy->{target};
+    die "the target has an interrupted installation, and a unit action requires a committed"
+        . " installation\n"
+        if -e $journal_path->($target);
+    my $installed = $read_installed->($target);
+    die "the target does not have an installed record\n" if !$installed;
+    my ($record) = grep { $_->{path} eq $path } @{ $installed->{files} };
+    die "the installed record of this target does not list the unit file $path\n" if !$record;
+    die "the unit file $path does not match the installed record\n"
+        if !$observation_matches->(observe_file($path), $record);
+};
+
+# The function runs a read-only systemctl query and returns the first line of its output.
+# systemctl is-enabled and is-active print the state and exit with a nonzero status for most
+# states.
+my $query_systemctl = sub {
+    my (@arguments) = @_;
+
+    my $output = '';
+    my $errors = '';
+    PVE::Tools::run_command(
+        [$SYSTEMCTL_COMMAND, @arguments],
+        outfunc => sub { $output .= shift() . "\n" },
+        errfunc => sub { $errors .= shift() . "\n" },
+        timeout => $UNIT_TIMEOUT_SECONDS,
+        noerr => 1,
+    );
+    my ($line) = split(m/\n/, $output);
+    if (!defined($line) || $line eq '') {
+        $errors = substr($errors, 0, $UNIT_STDERR_LIMIT);
+        $errors =~ s/\s+\z//;
+        die "systemctl @arguments did not print a state: $errors\n";
+    }
+    return $line;
+};
+
+# The function returns the unit file state and the active state of a unit that the target owns.
+# found is false when the unit file does not exist or systemd does not find the unit. The
+# function does not change a file or a unit.
+sub read_unit {
+    my ($target, $unit) = @_;
+
+    my $policy = load_policy($target);
+    check_node($policy);
+    my ($name, $path) = $owned_unit->($policy, $unit);
+    my $absent = { name => $name, found => 0 };
+    return $absent if !observe_file($path)->{present};
+    my $file_state = $query_systemctl->('is-enabled', '--', $name);
+    return $absent if $file_state eq 'not-found';
+    return {
+        name => $name,
+        found => 1,
+        unit_file_state => $file_state,
+        active_state => $query_systemctl->('is-active', '--', $name),
+    };
+}
+
+# The function checks a unit action before the API starts a worker and returns the checked
+# target, unit, and action.
+sub check_unit_request {
+    my ($target, $unit, $action) = @_;
+
+    my $policy = load_policy($target);
+    check_node($policy);
+    my ($name, $path) = $owned_unit->($policy, $unit);
+    die "the unit action is missing\n" if !defined($action) || ref($action);
+    die "the unit action '$action' is not supported\n" if !$UNIT_ACTIONS->{$action};
+    $check_installed_unit->($policy, $path);
+    return {
+        target => $policy->{target},
+        unit => $name,
+        action => $untaint->($action, qr/[a-z-]+/, 'unit action'),
+    };
+}
+
+# The function runs one unit action in a task worker. After it acquires the target lock, it
+# loads the policy and checks the installed unit file again.
+sub run_unit_action {
+    my ($target, $unit, $action) = @_;
+
+    return with_target_lock(
+        check_target($target),
+        sub {
+            my $request = check_unit_request($target, $unit, $action);
+            my @arguments = ($request->{action});
+            push @arguments, '--', $request->{unit} if $request->{action} ne 'daemon-reload';
+            $run_systemctl->(@arguments);
+            print "the task ran systemctl @arguments\n";
+        },
+    );
+}
+
 # The function returns the policy identity, the installed record, and the live state of each
 # installed file and owned directory. Without an installed record, the files and directories
 # are those of the policy. The function does not change a file.
