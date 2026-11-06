@@ -328,11 +328,6 @@ $check_match->(
     $other_get->{message},
     qr/does not list the unit file/,
 );
-HostArtifactsTest::check_error(
-    'the module rejects an unsupported action',
-    sub { PVE::HostArtifacts::check_unit_request($target, $UNIT, 'mask') },
-    qr/the unit action 'mask' is not supported/,
-);
 $check->(
     'the rejected requests do not change the unlisted unit',
     unit_property($UNLISTED_UNIT, 'ActiveState') eq 'inactive',

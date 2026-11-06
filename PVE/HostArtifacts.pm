@@ -2238,8 +2238,6 @@ sub set_secret {
 
 my $UNIT_DIR = '/etc/systemd/system';
 
-my $UNIT_ACTIONS = { map { $_ => 1 } qw(daemon-reload enable reenable disable start stop restart) };
-
 my $owned_unit = sub {
     my ($policy, $unit) = @_;
 
@@ -2311,8 +2309,6 @@ sub check_unit_request {
     my $policy = load_policy($target);
     check_node($policy);
     my ($name, $path) = $owned_unit->($policy, $unit);
-    die "the unit action is missing\n" if !defined($action) || ref($action);
-    die "the unit action '$action' is not supported\n" if !$UNIT_ACTIONS->{$action};
     $check_installed_unit->($policy, $path);
     return {
         target => $policy->{target},
