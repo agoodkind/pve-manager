@@ -3,11 +3,39 @@ package PVE::API2::NodeConfig;
 use strict;
 use warnings;
 
+use PVE::Exception qw(raise_perm_exc);
 use PVE::JSONSchema qw(get_standard_option);
 use PVE::NodeConfig;
+use PVE::RPCEnvironment;
 use PVE::Tools qw(extract_param);
 
 use base qw(PVE::RESTHandler);
+
+my $acme_domain_key_re = qr/^acmedomain\d+$/;
+
+# Returns the scoped privilege that authorizes a change to one node config key,
+# or undef for a key that only Sys.Modify on / may change.
+my $acme_key_privilege = sub {
+    my ($key, $is_delete) = @_;
+
+    return 'Sys.ACME.Config.Account.Modify' if $key eq 'acme';
+    return undef if $key !~ $acme_domain_key_re;
+    return $is_delete ? 'Sys.ACME.Config.Domain.Remove' : 'Sys.ACME.Config.Domain.Modify';
+};
+
+# Checks a request from a user without Sys.Modify on /. Every changed key must
+# be an ACME key, and the user needs the scoped privilege for that change on
+# the node.
+my $check_scoped_change = sub {
+    my ($rpcenv, $authuser, $node, $set_keys, $deleted_keys) = @_;
+
+    raise_perm_exc("/, Sys.Modify") if !@$set_keys && !@$deleted_keys;
+
+    for my $change ((map { [$_, 0] } @$set_keys), (map { [$_, 1] } @$deleted_keys)) {
+        my $privilege = $acme_key_privilege->(@$change) // raise_perm_exc("/, Sys.Modify");
+        $rpcenv->check($authuser, "/nodes/$node", [$privilege]);
+    }
+};
 
 my $node_config_schema = PVE::NodeConfig::get_nodeconfig_schema();
 my $node_config_keys = [sort keys %$node_config_schema];
@@ -38,7 +66,9 @@ __PACKAGE__->register_method({
     method => 'GET',
     description => "Get node configuration options.",
     permissions => {
-        check => ['perm', '/', ['Sys.Audit']],
+        description => "Requires Sys.Audit on /. With Sys.ACME.Config.Audit on"
+            . " /nodes/{node}, only the 'acme' and 'acmedomain' options are returned.",
+        user => 'all',
     },
     proxyto => 'node',
     parameters => {
@@ -61,7 +91,23 @@ __PACKAGE__->register_method({
     code => sub {
         my ($param) = @_;
 
-        my $config = PVE::NodeConfig::load_config($param->{node});
+        my $rpcenv = PVE::RPCEnvironment::get();
+        my $authuser = $rpcenv->get_user();
+        my $node = $param->{node};
+
+        my $reads_all_keys =
+            $authuser eq 'root@pam' || $rpcenv->check($authuser, '/', ['Sys.Audit'], 1);
+        $rpcenv->check($authuser, "/nodes/$node", ['Sys.ACME.Config.Audit'])
+            if !$reads_all_keys;
+
+        my $config = PVE::NodeConfig::load_config($node);
+
+        if (!$reads_all_keys) {
+            for my $key (keys %$config) {
+                next if $key eq 'digest' || $key eq 'acme' || $key =~ $acme_domain_key_re;
+                delete $config->{$key};
+            }
+        }
 
         if (defined(my $prop = $param->{property})) {
             return {} if !exists $config->{$prop};
@@ -78,7 +124,10 @@ __PACKAGE__->register_method({
     method => 'PUT',
     description => "Set node configuration options.",
     permissions => {
-        check => ['perm', '/', ['Sys.Modify']],
+        description => "Requires Sys.Modify on /. A request that changes only 'acme' and"
+            . " 'acmedomain' options requires the matching Sys.ACME.Config privilege on"
+            . " /nodes/{node}.",
+        user => 'all',
     },
     protected => 1,
     proxyto => 'node',
@@ -93,6 +142,15 @@ __PACKAGE__->register_method({
         my $delete = extract_param($param, 'delete');
         my $node = extract_param($param, 'node');
         my $digest = extract_param($param, 'digest');
+
+        my $rpcenv = PVE::RPCEnvironment::get();
+        my $authuser = $rpcenv->get_user();
+        my $changes_all_keys =
+            $authuser eq 'root@pam' || $rpcenv->check($authuser, '/', ['Sys.Modify'], 1);
+        if (!$changes_all_keys) {
+            my $deleted_keys = [PVE::Tools::split_list($delete // '')];
+            $check_scoped_change->($rpcenv, $authuser, $node, [keys %$param], $deleted_keys);
+        }
 
         my $code = sub {
             my $conf = PVE::NodeConfig::load_config($node);

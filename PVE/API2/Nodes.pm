@@ -50,6 +50,8 @@ use PVE::API2::Certificates;
 use PVE::API2::Disks;
 use PVE::API2::Firewall::Host;
 use PVE::API2::Hardware;
+use PVE::API2::HostArtifacts;
+use PVE::API2::KernelModules;
 use PVE::API2::LXC::Status;
 use PVE::API2::LXC;
 use PVE::API2::Network;
@@ -198,6 +200,16 @@ __PACKAGE__->register_method({
 __PACKAGE__->register_method({
     subclass => "PVE::API2::NodeConfig",
     path => 'config',
+});
+
+__PACKAGE__->register_method({
+    subclass => "PVE::API2::KernelModules",
+    path => 'kernel-modules',
+});
+
+__PACKAGE__->register_method({
+    subclass => "PVE::API2::HostArtifacts",
+    path => 'host-artifacts',
 });
 
 __PACKAGE__->register_method({

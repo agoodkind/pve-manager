@@ -11,6 +11,7 @@ PERLSOURCE = 			\
 	CertHelpers.pm		\
 	ExtMetric.pm		\
 	HTTPServer.pm		\
+	HostArtifacts.pm	\
 	Jobs.pm			\
 	NodeConfig.pm		\
 	PullMetric.pm		\
