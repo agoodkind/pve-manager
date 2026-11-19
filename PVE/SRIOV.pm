@@ -274,6 +274,7 @@ sub observe {
         inspect_guest($id, $guests->{$id}, \%by_pci, \%by_link, \%owners, \%netns, $reservations);
     }
     for my $pci (keys %by_pci) {
+        $by_pci{$pci}->{in_container} = exists($netns{$pci}) ? JSON::true : JSON::false;
         $owners{$pci} = "in use by VM $reservations->{$pci}" if defined($reservations->{$pci});
     }
     return ($state, \%owners, \%netns);

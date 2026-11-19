@@ -14,7 +14,7 @@ my $mode = shift // die "Specify unused, attached, or mapped.\n";
 my $port = shift // die "Specify the dedicated physical interface.\n";
 my $path = shift // die "Specify the JSON declaration file.\n";
 my $desired = decode_json(PVE::File::file_get_contents($path));
-my $json = JSON->new->canonical;
+my $json = JSON->new->canonical->allow_nonref;
 my $node = PVE::INotify::nodename();
 
 sub request {
@@ -60,6 +60,9 @@ if ($mode eq 'unused') {
     my $after = request('PUT', $desired);
     is_deeply(request('GET'), $after, 'GET reads the enabled VFs and the saved declaration');
     check_declared_vfs($after);
+    for my $vf ($after->{vfs}->@*) {
+        is($json->encode($vf->{in_container}), 'false', "VF $vf->{index} reports false on the guest-free node");
+    }
     is_deeply(request('PUT', $desired), $after, 'Repeated PUT preserves runtime and desired state');
     my $pci = $after->{vfs}->[$desired->{vfs}->[0]->{index}]->{pci};
     PVE::QemuServer::PCI::reserve_pci_usage($pci, $reserve_id, 30);
@@ -101,6 +104,9 @@ if ($mode eq 'unused') {
     if ($vf->{driver} ne 'vfio-pci') {
         die "Specify the interface name in the running container.\n" if !defined($guest_name);
         is($before->{vfs}->[$index]->{ifname}, $guest_name, 'GET locates the moved VF in the container');
+        is($json->encode($before->{vfs}->[$index]->{in_container}), 'true', 'GET reports a VF in the container namespace');
+    } else {
+        is($json->encode($before->{vfs}->[$index]->{in_container}), 'false', 'GET reports false for a VM passthrough VF');
     }
     is_deeply(request('PUT', $desired), $before, 'A running guest permits an identical PUT');
     my $class = $vf->{driver} eq 'vfio-pci' ? 'PVE::QemuConfig' : 'PVE::LXC::Config';

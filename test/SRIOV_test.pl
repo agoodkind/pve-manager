@@ -17,6 +17,13 @@ sub request {
     return $handler->handle($info, $param, 1);
 }
 
+for my $method (qw(GET PUT)) {
+    my (undef, $info) = PVE::API2::SRIOV->find_handler($method, 'lo', { node => 'localhost' });
+    my $field = $info->{returns}->{properties}->{vfs}->{items}->{properties}->{in_container};
+    is($field->{type}, 'boolean', "$method exposes a Boolean container location for each runtime VF");
+    ok(!$field->{optional}, "$method requires the container location in the response");
+}
+
 for my $method (qw(GET PUT DELETE)) {
     my $body = $method eq 'PUT' ? { numvfs => 1, vfs => [] } : {};
     eval { request($method, 'lo', $body) };
@@ -31,6 +38,10 @@ eval { request('PUT', 'lo', { numvfs => 1, vfs => [{ index => 0, mac => 'invalid
 like("$@", qr/mac/, 'PUT rejects an invalid VF MAC address');
 eval { request('PUT', 'lo', { numvfs => 1, vfs => [{ index => 0, mac => '02:00:00:00:00:01', driver => 'iavf', vmid => 100 }] }) };
 like("$@", qr/vmid/, 'PUT rejects a guest attachment field');
+eval { request('PUT', 'lo', {
+    numvfs => 1, vfs => [{ index => 0, mac => '02:00:00:00:00:01', driver => 'iavf', in_container => 1 }],
+}) };
+like("$@", qr/in_container/, 'PUT rejects the computed container location in a declaration');
 for my $case (
     ['QEMU', \&PVE::QemuServer::PCI::lock_hostpci_for_start, { hostpci0 => 'mapping=test-vf' }],
     ['LXC', \&PVE::LXC::lock_hostnics_for_start, { hostnic0 => 'link=test-vf' }],

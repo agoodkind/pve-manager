@@ -29,6 +29,10 @@ my $state = {
                     pci => { type => 'string', description => 'PCI domain, bus, slot, and function.' },
                     driver => { type => 'string', optional => 1, description => 'Bound PCI driver.' },
                     ifname => { type => 'string', optional => 1, description => 'Current Linux interface name in the host or container.' },
+                    in_container => {
+                        type => 'boolean',
+                        description => 'True when Proxmox finds this PCI function in a running container network namespace.',
+                    },
                 },
             },
         },
