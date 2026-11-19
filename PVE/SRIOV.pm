@@ -156,20 +156,42 @@ sub with_guest_locks {
 }
 
 sub inspect_guest {
-    my ($id, $guest, $by_pci, $by_link, $owners, $netns) = @_;
+    my ($id, $guest, $by_pci, $by_link, $owners, $netns, $reservations) = @_;
     my $type = $guest->{type};
     if ($type eq 'qemu') {
         return if !PVE::QemuServer::check_running($id, 1);
-        my @addresses;
         my $config = PVE::QemuConfig->load_config($id, $guest->{node});
+        my (%devices, %possible_keys);
         for my $key (grep { /\Ahostpci\d+\z/ } keys %$config) {
-            my $device = PVE::QemuServer::PCI::parse_hostpci($config->{$key});
-            for my $alternative ($device->{ids}->@*) {
-                push @addresses, map { $_->{id} } @$alternative;
+            my $alternatives = PVE::QemuServer::PCI::parse_hostpci($config->{$key})->{ids};
+            $devices{$key} = $alternatives;
+            for my $group (@$alternatives) {
+                $possible_keys{$_->{id}}->{$key} = 1 for @$group;
             }
         }
-        for my $address (@addresses) {
-            $owners->{$address} = "VM $id" if exists($by_pci->{$address});
+        for my $key (keys %devices) {
+            my $alternatives = $devices{$key};
+            if (@$alternatives == 1) {
+                for my $function ($alternatives->[0]->@*) {
+                    $owners->{$function->{id}} = "in use by VM $id" if exists($by_pci->{$function->{id}});
+                }
+                next;
+            }
+
+            my @selected = grep {
+                !grep { ($reservations->{$_->{id}} // -1) != $id } @$_
+            } @$alternatives;
+            # A reservation records the VMID, but not the hostpci property.
+            next if @selected == 1 && !grep {
+                keys($possible_keys{$_->{id}}->%*) > 1
+            } $selected[0]->@*;
+            for my $alternative (@$alternatives) {
+                for my $function (@$alternative) {
+                    my $pci = $function->{id};
+                    next if !exists($by_pci->{$pci});
+                    $owners->{$pci} //= "unavailable because QEMU cannot identify the selected PCI mapping for $key on VM $id";
+                }
+            }
         }
         return;
     }
@@ -181,7 +203,7 @@ sub inspect_guest {
     my $hostnics = PVE::LXC::Config->get_hostnics($config);
     for my $nic (values %$hostnics) {
         my $address = $by_link->{$nic->{link}};
-        $owners->{$address} = "container $id" if defined($address);
+        $owners->{$address} = "in use by container $id" if defined($address);
     }
 
     return if !grep { defined($_->{driver}) && $_->{driver} ne 'vfio-pci' && !defined($_->{ifname}) } values %$by_pci;
@@ -201,7 +223,7 @@ sub inspect_guest {
         next if !defined($bus) || !exists($by_pci->{$bus});
         $by_pci->{$bus}->{ifname} = $name;
         $netns->{$bus} = $pid;
-        $owners->{$bus} = "container $id";
+        $owners->{$bus} = "in use by container $id";
     }
 }
 
@@ -223,7 +245,7 @@ sub observe {
     my (%owners, %netns);
     return ($state, \%owners, \%netns) if !$count;
     my $links = decode_json(output(['/sbin/ip', '-j', '-d', 'link', 'show', 'dev', $name]));
-    my %macs = map { $_->{vf} => $_->{mac} } $links->[0]->{vfinfo_list}->@*;
+    my %macs = map { $_->{vf} => $_->{address} } $links->[0]->{vfinfo_list}->@*;
     my (%by_pci, %by_link);
     for my $index (0 .. $count - 1) {
         my $path = "$pf/virtfn$index";
@@ -247,12 +269,12 @@ sub observe {
         next if !defined($vf->{ifname}) || $vf->{index} >= $count;
         $by_link{$vf->{ifname}} = $state->{vfs}->[$vf->{index}]->{pci};
     }
-    for my $id (sort { $a <=> $b } keys %$guests) {
-        inspect_guest($id, $guests->{$id}, \%by_pci, \%by_link, \%owners, \%netns);
-    }
     my $reservations = PVE::QemuServer::PCI::get_reservation_owners();
+    for my $id (sort { $a <=> $b } keys %$guests) {
+        inspect_guest($id, $guests->{$id}, \%by_pci, \%by_link, \%owners, \%netns, $reservations);
+    }
     for my $pci (keys %by_pci) {
-        $owners{$pci} = "VM $reservations->{$pci}" if defined($reservations->{$pci});
+        $owners{$pci} = "in use by VM $reservations->{$pci}" if defined($reservations->{$pci});
     }
     return ($state, \%owners, \%netns);
 }
@@ -378,8 +400,8 @@ sub apply_port {
             my $host_name = defined($old) ? $old->{ifname} : $vf->{ifname};
             $change ||= differs($vf, $wanted, $host_name);
         }
-        my $reason = $owner // 'an unidentified network namespace';
-        die "VF $index ($vf->{pci}) on $name is in use by $reason.\n" if $change;
+        my $reason = $owner // 'in use by an unidentified network namespace';
+        die "VF $index ($vf->{pci}) on $name is $reason.\n" if $change;
     }
 
     if ($resize) {
