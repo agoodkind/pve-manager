@@ -11,6 +11,10 @@ check: test-replication test-balloon test-vzdump test-osd test-ceph-health test-
 test-sriov-api:
 	perl ./SRIOV_test.pl
 
+.PHONY: test-sriov-start
+test-sriov-start:
+	perl ./SRIOV_start_test.pl $(SRIOV_TEST_VMID)
+
 .PHONY: test-balloon
 test-balloon:
 	./balloontest.pl

@@ -17,11 +17,13 @@ use PVE::LXC;
 use PVE::LXC::Config;
 use PVE::QemuConfig;
 use PVE::QemuServer;
+use PVE::QemuServer::Helpers;
 use PVE::QemuServer::PCI;
+use PVE::SRIOVLock;
 use PVE::Tools qw(lock_file run_command);
 
 my $state_dir = '/etc/pve-overlay/sriov';
-my $lock = '/run/lock/pve-overlay-sriov.lock';
+my $lock = PVE::SRIOVLock::PATH;
 my $pci_root = '/sys/bus/pci';
 my $name_pattern = '[a-zA-Z0-9_][a-zA-Z0-9_.-]{0,14}';
 my $driver_pattern = '[a-zA-Z0-9_][a-zA-Z0-9_-]{0,63}';
@@ -120,7 +122,28 @@ sub local_guests {
     PVE::Cluster::cfs_update();
     my $node = PVE::INotify::nodename();
     my $ids = PVE::Cluster::get_vmlist()->{ids};
-    return { map { $_ => $ids->{$_}->{type} } grep { $ids->{$_}->{node} eq $node } keys %$ids };
+    my $active_cts = PVE::LXC::list_active_containers();
+    my $units = decode_json(output([
+        '/bin/systemctl', 'list-units', '--all', '--output=json', '--no-pager',
+        'pve-container@*.service', 'pve-container-debug@*.service',
+    ]));
+    my %starting_cts;
+    for my $unit (@$units) {
+        next if $unit->{active} =~ /\A(?:inactive|failed)\z/;
+        my ($id) = $unit->{unit} =~ /\Apve-container(?:-debug)?@(\d+)\.service\z/;
+        die "Cannot identify container unit '$unit->{unit}'.\n" if !defined($id);
+        die "Cannot find the configuration of active container $id.\n" if !$ids->{$id};
+        $starting_cts{$id} = 1;
+    }
+    my %guests;
+    for my $id (keys %$ids) {
+        my $guest = $ids->{$id};
+        # A migration can start the guest before the cluster changes its config owner.
+        next if $guest->{node} ne $node && !$active_cts->{$id} && !$starting_cts{$id}
+            && !($guest->{type} eq 'qemu' && PVE::QemuServer::Helpers::vm_running_locally($id));
+        $guests{$id} = { type => $guest->{type}, node => $guest->{node}, ct_unit => $starting_cts{$id} // 0 };
+    }
+    return \%guests;
 }
 
 # Guest start and device hotplug use the same per-guest configuration locks.
@@ -128,16 +151,17 @@ sub with_guest_locks {
     my ($guests, $ids, $operation) = @_;
     return $operation->() if !@$ids;
     my $id = shift @$ids;
-    my $class = $guests->{$id} eq 'qemu' ? 'PVE::QemuConfig' : 'PVE::LXC::Config';
+    my $class = $guests->{$id}->{type} eq 'qemu' ? 'PVE::QemuConfig' : 'PVE::LXC::Config';
     return $class->lock_config($id, sub { with_guest_locks($guests, $ids, $operation) });
 }
 
 sub inspect_guest {
-    my ($id, $type, $by_pci, $by_link, $owners, $netns) = @_;
+    my ($id, $guest, $by_pci, $by_link, $owners, $netns) = @_;
+    my $type = $guest->{type};
     if ($type eq 'qemu') {
         return if !PVE::QemuServer::check_running($id, 1);
-        my @addresses = PVE::QemuServer::PCI::get_reservations($id)->@*;
-        my $config = PVE::QemuConfig->load_config($id);
+        my @addresses;
+        my $config = PVE::QemuConfig->load_config($id, $guest->{node});
         for my $key (grep { /\Ahostpci\d+\z/ } keys %$config) {
             my $device = PVE::QemuServer::PCI::parse_hostpci($config->{$key});
             for my $alternative ($device->{ids}->@*) {
@@ -151,8 +175,9 @@ sub inspect_guest {
     }
 
     die "Unsupported local guest type '$type'.\n" if $type ne 'lxc';
-    return if !PVE::LXC::check_running($id);
-    my $config = PVE::LXC::Config->load_config($id);
+    my $running = PVE::LXC::check_running($id);
+    return if !$running && !$guest->{ct_unit};
+    my $config = PVE::LXC::Config->load_config($id, $guest->{node});
     my $hostnics = PVE::LXC::Config->get_hostnics($config);
     for my $nic (values %$hostnics) {
         my $address = $by_link->{$nic->{link}};
@@ -160,6 +185,7 @@ sub inspect_guest {
     }
 
     return if !grep { defined($_->{driver}) && $_->{driver} ne 'vfio-pci' && !defined($_->{ifname}) } values %$by_pci;
+    return if !$running;
     my $pid = PVE::LXC::find_lxc_pid($id);
     my @ns = ('/usr/bin/nsenter', '--target', $pid, '--net', '--');
     my $links = decode_json(output([@ns, '/sbin/ip', '-j', '-d', 'link', 'show']));
@@ -223,6 +249,10 @@ sub observe {
     }
     for my $id (sort { $a <=> $b } keys %$guests) {
         inspect_guest($id, $guests->{$id}, \%by_pci, \%by_link, \%owners, \%netns);
+    }
+    my $reservations = PVE::QemuServer::PCI::get_reservation_owners();
+    for my $pci (keys %by_pci) {
+        $owners{$pci} = "VM $reservations->{$pci}" if defined($reservations->{$pci});
     }
     return ($state, \%owners, \%netns);
 }
@@ -405,71 +435,82 @@ sub get_port {
     });
 }
 
+sub with_mutation_locks {
+    my ($operation) = @_;
+    my $guests = local_guests();
+    my @ids = sort { $a <=> $b } keys %$guests;
+    return with_guest_locks($guests, \@ids, sub {
+        return locked(sub {
+            my $current_guests = local_guests();
+            die "Local guest inventory changed during SR-IOV locking. Retry the request.\n"
+                if $json->encode($guests) ne $json->encode($current_guests);
+            return $operation->($guests);
+        });
+    });
+}
+
 sub update_port {
-    my ($name, $request, $action) = @_;
+    my ($name, $request, $action, $guests) = @_;
     my $pf = pf_device($name);
     my $old = saved($name);
     return undef if $action eq 'delete' && !defined($old);
     $request = $old if $action eq 'restore';
     my $desired = normalize($name, $request, number("$pf/sriov_totalvfs"));
-    my $guests = local_guests();
-    my @ids = sort { $a <=> $b } keys %$guests;
-    return with_guest_locks($guests, \@ids, sub {
-        my $current_guests = local_guests();
-        die "Local guest inventory changed during SR-IOV locking. Retry the request.\n"
-            if $json->encode($guests) ne $json->encode($current_guests);
-        if ($action eq 'set') {
-            for my $path (qw(
-                /etc/systemd/system/pve-overlay-sriov.service
-                /etc/systemd/system/pve-guests.service.d/50-pve-overlay-sriov.conf
-                /etc/systemd/system/pve-ha-lrm.service.d/50-pve-overlay-sriov.conf
-                /usr/share/pve-overlay/sriov-restore
-            )) {
-                die "Install the SR-IOV boot file $path before saving declarations.\n" if !-f $path;
-            }
+    if ($action eq 'set') {
+        for my $path (qw(
+            /etc/systemd/system/pve-overlay-sriov.service
+            /etc/systemd/system/pve-guests.service.d/50-pve-overlay-sriov.conf
+            /etc/systemd/system/pve-ha-lrm.service.d/50-pve-overlay-sriov.conf
+            /usr/share/pve-overlay/sriov-restore
+        )) {
+            die "Install the SR-IOV boot file $path before saving declarations.\n" if !-f $path;
         }
-        my ($before, $owners, $netns) = observe($name, $old, $guests);
-        my $after = eval {
-            my $result = apply_port($name, $before, $owners, $desired, $guests, $netns);
-            if ($action eq 'delete') {
-                unlink("$state_dir/$name.json") or die "Cannot delete $state_dir/$name.json: $!\n";
-            } elsif ($action eq 'set') {
-                make_path($state_dir, { mode => 0755 });
-                PVE::File::file_set_contents("$state_dir/$name.json", $json->encode($desired) . "\n", 0644);
-            }
-            $result;
-        };
-        if (my $error = $@) {
-            my $actual = eval { my ($state) = observe($name, $old, $guests); $state };
-            my $detail = $@ || $json->encode({ numvfs => $actual->{numvfs}, vfs => $actual->{vfs} });
-            die "Cannot $action SR-IOV on $name: $error" . "Current VF state: $detail\n";
+    }
+    my ($before, $owners, $netns) = observe($name, $old, $guests);
+    my $after = eval {
+        my $result = apply_port($name, $before, $owners, $desired, $guests, $netns);
+        if ($action eq 'delete') {
+            unlink("$state_dir/$name.json") or die "Cannot delete $state_dir/$name.json: $!\n";
+        } elsif ($action eq 'set') {
+            make_path($state_dir, { mode => 0755 });
+            PVE::File::file_set_contents("$state_dir/$name.json", $json->encode($desired) . "\n", 0644);
         }
-        return $after;
-    });
+        $result;
+    };
+    if (my $error = $@) {
+        my $actual = eval { my ($state) = observe($name, $old, $guests); $state };
+        my $detail = $@ || $json->encode({ numvfs => $actual->{numvfs}, vfs => $actual->{vfs} });
+        die "Cannot $action SR-IOV on $name: $error" . "Current VF state: $detail\n";
+    }
+    return $after;
 }
 
 sub set_port {
     my ($input, $request) = @_;
     my $name = port_name($input);
-    return locked(sub { update_port($name, $request, 'set') });
+    pf_device($name);
+    return with_mutation_locks(sub { update_port($name, $request, 'set', @_) });
 }
 
 sub delete_port {
     my ($input) = @_;
     my $name = port_name($input);
-    locked(sub { update_port($name, { numvfs => 0, vfs => [] }, 'delete') });
+    pf_device($name);
+    with_mutation_locks(sub { update_port($name, { numvfs => 0, vfs => [] }, 'delete', @_) });
     return;
 }
 
 sub restore {
-    locked(sub {
+    return if !-d $state_dir;
+    with_mutation_locks(sub {
+        my ($guests) = @_;
         return if !-d $state_dir;
         for my $entry (entries($state_dir)) {
             next if $entry !~ /\.json\z/;
             my ($name) = $entry =~ /\A($name_pattern)\.json\z/;
             die "Invalid SR-IOV declaration filename '$entry'.\n" if !defined($name);
             wait_until("physical interface $name", sub { -e "/sys/class/net/$name/device/sriov_numvfs" });
-            update_port($name, undef, 'restore');
+            update_port($name, undef, 'restore', $guests);
         }
     });
 }

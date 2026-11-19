@@ -30,6 +30,9 @@ if ($mode eq 'unused') {
     die "This test requires a dedicated unmanaged adapter with zero enabled VFs.\n"
         if $before->{numvfs} || exists($before->{desired});
     die "Declare at least one VF and a positive VF count.\n" if !@{ $desired->{vfs} } || !$desired->{numvfs};
+    my $reserve_id = shift // die "Specify an unused VMID for the pending PCI reservation test.\n";
+    die "The reservation test requires an unused VMID.\n"
+        if $reserve_id !~ /\A\d+\z/ || PVE::Cluster::get_vmlist()->{ids}->{$reserve_id};
     my $after = request('PUT', $desired);
     is($after->{numvfs}, $desired->{numvfs}, 'PUT enables the requested number of VFs');
     for my $vf ($desired->{vfs}->@*) {
@@ -40,6 +43,12 @@ if ($mode eq 'unused') {
         is($actual->{ifname}, $vf->{ifname}, 'The network driver uses the stable name') if defined($vf->{ifname});
     }
     is_deeply(request('PUT', $desired), $after, 'Repeated PUT preserves runtime and desired state');
+    my $pci = $after->{vfs}->[$desired->{vfs}->[0]->{index}]->{pci};
+    PVE::QemuServer::PCI::reserve_pci_usage($pci, $reserve_id, 30);
+    eval { request('DELETE') };
+    my $reserve_error = "$@";
+    PVE::QemuServer::PCI::remove_pci_reservation($reserve_id, [$pci]);
+    like($reserve_error, qr/in use by VM \Q$reserve_id\E\b/, 'A PCI reservation protects the VF before QEMU publishes its PID');
     run_command(['/bin/systemctl', 'restart', 'pve-overlay-sriov.service']);
     is_deeply(request('GET'), $after, 'Boot restoration preserves the declaration');
     request('DELETE');
