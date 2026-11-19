@@ -1,0 +1,9 @@
+[Unit]
+Description=Restore persistent SR-IOV virtual functions
+Requires=pve-cluster.service
+After=pve-cluster.service systemd-modules-load.service networking.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/bin/perl -T /usr/share/pve-overlay/sriov-restore

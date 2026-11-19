@@ -1,0 +1,8 @@
+#!/usr/bin/perl -T
+
+use strict;
+use warnings;
+use PVE::SRIOV;
+
+$ENV{PATH} = '/usr/sbin:/usr/bin:/sbin:/bin';
+PVE::SRIOV::restore();

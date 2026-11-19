@@ -51,6 +51,7 @@ use PVE::API2::Firewall::Host;
 use PVE::API2::Hardware;
 use PVE::API2::HostArtifacts;
 use PVE::API2::KernelModules;
+use PVE::API2::SRIOV;
 use PVE::API2::LXC::Status;
 use PVE::API2::LXC;
 use PVE::API2::Network;
@@ -207,6 +208,11 @@ __PACKAGE__->register_method({
 });
 
 __PACKAGE__->register_method({
+    subclass => "PVE::API2::SRIOV",
+    path => 'sriov',
+});
+
+__PACKAGE__->register_method({
     subclass => "PVE::API2::HostArtifacts",
     path => 'host-artifacts',
 });
@@ -267,6 +273,7 @@ __PACKAGE__->register_method({
             { name => 'sdn' },
             { name => 'services' },
             { name => 'spiceshell' },
+            { name => 'sriov' },
             { name => 'startall' },
             { name => 'status' },
             { name => 'stopall' },

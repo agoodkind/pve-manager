@@ -16,6 +16,7 @@ PERLSOURCE = 			\
 	NodeConfig.pm		\
 	PullMetric.pm		\
 	Report.pm		\
+	SRIOV.pm		\
 	VZDump.pm
 
 all: pvecfg.pm $(SUBDIRS)
