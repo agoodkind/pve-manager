@@ -10,7 +10,7 @@ use PVE::API2::SRIOV;
 use PVE::File;
 use PVE::Tools qw(run_command);
 
-my $mode = shift // die "Specify unused, attached, or mapped.\n";
+my $mode = shift // die "Specify unused, attached, mapped, or mixed.\n";
 my $port = shift // die "Specify the dedicated physical interface.\n";
 my $path = shift // die "Specify the JSON declaration file.\n";
 my $desired = decode_json(PVE::File::file_get_contents($path));
@@ -185,7 +185,30 @@ if ($mode eq 'unused') {
     request('PUT', $desired);
     die $error if $error;
     is_deeply(request('GET'), $before, 'The spare VF returns to its original configuration');
+} elsif ($mode eq 'mixed') {
+    my ($host_index, $moved_index, $shared_id, $private_id, $guest_name) = @ARGV;
+    die "Specify the host VF index, moved VF index, shared-namespace CT ID, private-namespace CT ID, and guest interface.\n"
+        if !defined($guest_name) || grep { !defined($_) || $_ !~ /\A\d+\z/ } ($host_index, $moved_index, $shared_id, $private_id);
+    die "Use distinct VF indices and a lower CT ID for the shared namespace.\n"
+        if $host_index == $moved_index || $shared_id >= $private_id;
+    my $pf = PVE::SRIOV::pf_device($port);
+    my @host_names = PVE::SRIOV::entries("$pf/virtfn$host_index/net");
+    die "The host VF must expose exactly one network interface.\n" if @host_names != 1;
+    my $shared_pid = PVE::LXC::find_lxc_pid($shared_id);
+    my $private_pid = PVE::LXC::find_lxc_pid($private_id);
+    my $net_id = sub { readlink("/proc/$_[0]/ns/net") // die "Cannot inspect the namespace of $_[0]: $!\n" };
+    my $host_ns = $net_id->('self');
+    die "The first CT must share the host network namespace.\n" if $net_id->($shared_pid) ne $host_ns;
+    die "The second CT must use its own network namespace.\n" if $net_id->($private_pid) eq $host_ns;
+    my $info = PVE::SRIOV::output(['/usr/bin/nsenter', '--target', $private_pid, '--net', '--',
+        '/sbin/ethtool', '-i', PVE::SRIOV::port_name($guest_name)]);
+    my $pci = $before->{vfs}->[$moved_index]->{pci};
+    die "The specified container interface must use the moved VF.\n" if !defined($pci) || $info !~ /^bus-info:\s*\Q$pci\E$/m;
+    is($before->{vfs}->[$host_index]->{ifname}, $host_names[0], 'GET reports the host-visible VF name');
+    is($json->encode($before->{vfs}->[$host_index]->{in_container}), 'false', 'GET excludes the shared namespace');
+    is($before->{vfs}->[$moved_index]->{ifname}, $guest_name, 'GET reports the moved VF name');
+    is($json->encode($before->{vfs}->[$moved_index]->{in_container}), 'true', 'GET identifies the VF in the private namespace');
 } else {
-    die "Specify unused, attached, or mapped.\n";
+    die "Specify unused, attached, mapped, or mixed.\n";
 }
 done_testing();

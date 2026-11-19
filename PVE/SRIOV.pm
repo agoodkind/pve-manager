@@ -155,6 +155,21 @@ sub with_guest_locks {
     return $class->lock_config($id, sub { with_guest_locks($guests, $ids, $operation) });
 }
 
+sub open_container_netns {
+    my ($pid) = @_;
+    my $path = "/proc/$pid/ns/net";
+    open(my $namespace, '<', $path) or die "Cannot open the network namespace at $path: $!\n";
+    my ($device, $inode) = stat($namespace) or die "Cannot stat the network namespace at $path: $!\n";
+    my ($host_device, $host_inode) = stat('/proc/self/ns/net') or die "Cannot stat the host network namespace: $!\n";
+    return undef if $device == $host_device && $inode == $host_inode;
+    return $namespace;
+}
+
+sub enter_netns {
+    my ($namespace) = @_;
+    return ('/usr/bin/nsenter', '--net=/proc/' . $$ . '/fd/' . fileno($namespace), '--');
+}
+
 sub inspect_guest {
     my ($id, $guest, $by_pci, $by_link, $owners, $netns, $reservations) = @_;
     my $type = $guest->{type};
@@ -206,10 +221,12 @@ sub inspect_guest {
         $owners->{$address} = "in use by container $id" if defined($address);
     }
 
-    return if !grep { defined($_->{driver}) && $_->{driver} ne 'vfio-pci' && !defined($_->{ifname}) } values %$by_pci;
     return if !$running;
-    my $pid = PVE::LXC::find_lxc_pid($id);
-    my @ns = ('/usr/bin/nsenter', '--target', $pid, '--net', '--');
+    my %missing = map { $_->{pci} => $_ }
+        grep { defined($_->{driver}) && $_->{driver} ne 'vfio-pci' && !defined($_->{ifname}) } values %$by_pci;
+    return if !%missing;
+    my $namespace = open_container_netns(PVE::LXC::find_lxc_pid($id)) // return;
+    my @ns = enter_netns($namespace);
     my $links = decode_json(output([@ns, '/sbin/ip', '-j', '-d', 'link', 'show']));
     for my $link (@$links) {
         next if grep { $_ eq 'LOOPBACK' } $link->{flags}->@*;
@@ -220,9 +237,9 @@ sub inspect_guest {
             my $info = output([@ns, '/sbin/ethtool', '-i', $name]);
             ($bus) = $info =~ /^bus-info:\s*($pci_pattern)$/m;
         }
-        next if !defined($bus) || !exists($by_pci->{$bus});
-        $by_pci->{$bus}->{ifname} = $name;
-        $netns->{$bus} = $pid;
+        next if !defined($bus) || !exists($missing{$bus});
+        $missing{$bus}->{ifname} = $name;
+        $netns->{$bus} = $namespace;
         $owners->{$bus} = "in use by container $id";
     }
 }
@@ -337,8 +354,8 @@ sub prepare_driver {
 sub permanent_mac {
     my ($current, $netns) = @_;
     my $name = $current->{ifname} // die "PCI device $current->{pci} does not expose a network interface.\n";
-    my $pid = $netns->{$current->{pci}};
-    my @prefix = defined($pid) ? ('/usr/bin/nsenter', '--target', $pid, '--net', '--') : ();
+    my $namespace = $netns->{$current->{pci}};
+    my @prefix = defined($namespace) ? enter_netns($namespace) : ();
     my $output = output([@prefix, '/sbin/ethtool', '-P', $name]);
     my ($mac) = $output =~ /^Permanent address:\s*([[:xdigit:]]{2}(?::[[:xdigit:]]{2}){5})$/m;
     die "Interface $name on $current->{pci} did not report its permanent MAC: $output" if !defined($mac);
